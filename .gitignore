@@ -27,3 +27,6 @@ conversations/
 active-model.json
 .llama-launch.cmd
 .embed-launch.cmd
+
+# Generated at runtime by fileserver.ps1 (the port it actually bound).
+.gobbonet-port

@@ -47,11 +47,25 @@ function Get-EnvOrDefault {
 
 $Root         = Get-EnvOrDefault 'GEMMA_ROOT'           (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $LlmPort      = [int](Get-EnvOrDefault 'GEMMA_LLM_PORT'      '11434')
+# The model NAME to ask the backend for.
+#
+# The client hardcodes {"model":"local"} because llama-server serves exactly
+# one model and ignores the field. Every other OpenAI-compatible backend -- a
+# gateway, vLLM, anything multi-model -- looks the name up and REJECTS 'local',
+# so generation fails against a server that is otherwise working perfectly.
+# When this is set the proxy rewrites the field; unset, the body passes through
+# byte-for-byte and upstream behaviour is unchanged.
+$LlmModel     = Get-EnvOrDefault 'GEMMA_LLM_MODEL'     ''
 $SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
-$ListenPort   = 8080
+# PATCHED (Aitherium fork, 2026-08-21): env-driven like every other setting
+# here. Upstream hardcodes 8080; on this machine that port belongs to the
+# mesh coordinator, so the app could not start at all and the only signal
+# was a 404 from the service that already had it. Defaults to 8080, so
+# nothing changes for anyone whose 8080 is free.
+$ListenPort   = [int](Get-EnvOrDefault 'GEMMA_LISTEN_PORT' '8080')
 $ServerExe    = Get-EnvOrDefault 'GEMMA_SERVER_EXE'     ''
 $ModelDir     = Get-EnvOrDefault 'GEMMA_MODEL_DIR'      (Join-Path $Root 'models')
 $CtxSize      = [int](Get-EnvOrDefault 'GEMMA_CTX_SIZE'      '16384')
@@ -725,6 +739,7 @@ $Script:JobWorkerScript = {
                         [System.IO.FileAccess]::Write,
                         [System.IO.FileShare]::ReadWrite)
         $buf = New-Object byte[] 8192
+        $pending = ''   # partial SSE line carried across reads
         try {
             while ($true) {
                 if (Test-Path $CancelPath) { $cancelled = $true; break }
@@ -739,8 +754,65 @@ $Script:JobWorkerScript = {
                 if ($cancelled) { break }
                 $n = $task.Result
                 if ($n -le 0) { break }
-                $outStream.Write($buf, 0, $n)
-                $outStream.Flush()
+
+                # TRANSLATE NATIVE EVENTS TO OPENAI CHUNKS.
+                #
+                # The client reads choices[0].delta.content -- the OpenAI shape.
+                # A llama-server speaks that natively, but a platform gateway may
+                # answer in its OWN framing:
+                #
+                #     event: token
+                #     data: {"t": "Hello", "n": 1, "type": "token"}
+                #
+                # which parses fine, contains the reply, and yields NOTHING at
+                # choices[0].delta.content. Measured 2026-08-21: the model
+                # answered in under a second and the UI rendered "<1s -- no
+                # response", with the text sitting in the spool the whole time.
+                # Worse, it varied BY MODEL -- one route passed OpenAI chunks
+                # through and another did not -- so it read as a flaky backend
+                # rather than a format mismatch.
+                #
+                # Line-aware, because a read boundary can split a frame in half.
+                # Anything unrecognised passes through unchanged, so a real
+                # OpenAI stream is untouched and this can only add support.
+                $pending += [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+                $emit = ''
+                while ($true) {
+                    $ix = $pending.IndexOf("`n")
+                    if ($ix -lt 0) { break }
+                    $line = $pending.Substring(0, $ix).TrimEnd("`r")
+                    $pending = $pending.Substring($ix + 1)
+                    $outLine = $line
+                    if ($line.StartsWith('event: ')) {
+                        $outLine = $null            # native framing; OpenAI has none
+                    } elseif ($line.StartsWith('data: ')) {
+                        $payload = $line.Substring(6)
+                        if ($payload -ne '[DONE]') {
+                            try {
+                                $o = $payload | ConvertFrom-Json
+                                if ($o.type -eq 'token' -and $null -ne $o.t) {
+                                    $chunk = @{
+                                        id = 'chatcmpl-adapter'
+                                        object = 'chat.completion.chunk'
+                                        model = 'local'
+                                        choices = @(@{ index = 0
+                                                       delta = @{ content = [string]$o.t }
+                                                       finish_reason = $null })
+                                    } | ConvertTo-Json -Depth 8 -Compress
+                                    $outLine = 'data: ' + $chunk
+                                } elseif ($o.type -eq 'complete' -or $o.type -eq 'done') {
+                                    $outLine = 'data: [DONE]'
+                                }
+                            } catch { }
+                        }
+                    }
+                    if ($null -ne $outLine) { $emit += $outLine + "`n" }
+                }
+                if ($emit -ne '') {
+                    $eb = [Text.Encoding]::UTF8.GetBytes($emit)
+                    $outStream.Write($eb, 0, $eb.Length)
+                    $outStream.Flush()
+                }
             }
         } finally {
             try { $outStream.Close() } catch { }
@@ -793,6 +865,16 @@ function Handle-Jobs {
 
         $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
         $body = $reader.ReadToEnd()
+        if ($LlmModel -ne '') {
+            # Swap the placeholder for a name the backend actually serves. Done
+            # here rather than in the client, so the browser keeps working
+            # unchanged against a plain llama-server.
+            try {
+                $o = $body | ConvertFrom-Json
+                $o.model = $LlmModel
+                $body = $o | ConvertTo-Json -Depth 20 -Compress
+            } catch { }
+        }
         $reader.Close()
         try { $null = $body | ConvertFrom-Json } catch {
             Write-Json $Response 400 @{ error = 'body is not valid JSON' }
@@ -1270,6 +1352,50 @@ function Update-ModelsListActive {
 function Handle-SwapModel {
     param($Request, $Response)
 
+    # SERVED BACKEND: swapping is just changing the name we ask for.
+    #
+    # Hot-swap upstream means killing llama-server, rewriting the launch script
+    # and booting a new GGUF. Against a served backend none of that applies --
+    # the models are already loaded and selection is one field in the request.
+    # Without this branch the picker renders the real roster and then 503s on
+    # every selection, which is a dropdown that exists to disappoint.
+    if ($LlmModel -ne '') {
+        $bodyRaw = ''
+        if ($Request.HasEntityBody) {
+            $sr = New-Object IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+            $bodyRaw = $sr.ReadToEnd(); $sr.Close()
+        }
+        $want = ''
+        try { $want = ($bodyRaw | ConvertFrom-Json).file } catch { }
+        if ([string]::IsNullOrWhiteSpace($want)) {
+            Write-Json $Response 400 @{ phase = 'error'; message = 'no model named' }
+            return
+        }
+        # Only accept a name the backend actually serves: this value comes from
+        # the client, and it is about to be put in every upstream request.
+        $known = @()
+        try {
+            $h = @{}
+            if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
+            $u = ('http://127.0.0.1:{0}/v1/models' -f $LlmPort)
+            $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
+            $known = ((($r.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id })
+        } catch { }
+        if ($known -notcontains $want) {
+            Write-Json $Response 400 @{ phase = 'error'; message = ("unknown model: {0}" -f $want) }
+            return
+        }
+        # Listed is not serving. Accepting a catalogued-but-dead model is what
+        # turned a swap into a ten-second silence with no reason given.
+        if (-not (Test-ModelServes $want)) {
+            Write-Json $Response 503 @{ phase = 'error'; message =
+                ("{0} is listed but not serving right now -- the backend answered 503. Pick another model." -f $want) }
+            return
+        }
+        $script:LlmModel = $want
+        Write-Json $Response 200 @{ phase = 'ready'; message = ("now using {0}" -f $want) }
+        return
+    }
     if (-not $HotSwapEnabled) {
         Write-Json $Response 503 @{ phase = 'error'; message = 'Hot-swap is not configured. Restart launch.bat.' }
         return
@@ -1381,8 +1507,53 @@ function Handle-SwapModel {
 # "ready" once llama-server's /health endpoint comes back online, so the
 # expensive readiness check only runs when somebody actually cares.
 # Times out at 180 seconds (consistent with the client-side budget).
+# ---------------------------------------------------------------------------
+# Can the backend actually SERVE this model right now?
+#
+# /v1/models is a menu, not liveness. Measured 2026-08-21 against the gateway:
+# it listed six models and THREE of them answered 503 "Inference backend
+# temporarily unavailable" -- so a picker built from the catalogue offered
+# choices that cannot reply, and choosing one produced a turn that sat for ten
+# seconds and rendered "no response...", with nothing anywhere saying why.
+#
+# One token is enough to separate "listed" from "serving", and the answer is
+# cached because this is asked once per list render and once per swap.
+# ---------------------------------------------------------------------------
+$script:LiveModelCache = @{}
+function Test-ModelServes {
+    param([string]$Model)
+    if ($Model -eq '') { return $false }
+    $hit = $script:LiveModelCache[$Model]
+    if ($null -ne $hit -and ((Get-Date) - $hit.At).TotalSeconds -lt 60) { return $hit.Ok }
+    $ok = $false
+    try {
+        $h = @{ 'Content-Type' = 'application/json' }
+        if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
+        $b = @{ model = $Model; messages = @(@{ role = 'user'; content = 'hi' }); max_tokens = 1 } | ConvertTo-Json -Compress
+        $u = ('http://127.0.0.1:{0}/v1/chat/completions' -f $LlmPort)
+        $r = Invoke-WebRequest -Uri $u -Method POST -Headers $h -Body $b -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
+        $ok = ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300)
+    } catch { $ok = $false }
+    $script:LiveModelCache[$Model] = @{ Ok = $ok; At = (Get-Date) }
+    return $ok
+}
+
 function Handle-SwapStatus {
     param($Request, $Response)
+
+    # SERVED BACKEND: the swap already happened, synchronously.
+    #
+    # /swap-model returns 200 {phase:'ready'} for a served backend -- there is no
+    # GGUF to load, only a name to change -- but the CLIENT does not treat that
+    # as the end. It polls /swap-status until phase == 'ready', and this read the
+    # GGUF swap-status file, which for a served backend never changes and never
+    # will. The poll therefore ran to its timeout and reported "Swap failed:
+    # Timed out waiting for model to load" for a swap that had already succeeded
+    # -- the model WAS switched, and the UI said it failed.
+    if ($LlmModel -ne '') {
+        Write-Json $Response 200 @{ phase = 'ready'; file = $LlmModel; model = $LlmModel }
+        return
+    }
 
     $st = Read-SwapStatus
     if ($null -eq $st) {
@@ -1449,17 +1620,84 @@ function Handle-SwapStatus {
 # Make sure System.Web is available for UrlDecode.
 Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://+:$ListenPort/")
-try {
-    $listener.Start()
-} catch {
-    Write-Host ("[fatal] could not bind http://+:{0}/ -- {1}" -f $ListenPort, $_.Exception.Message)
-    Write-Host '         Run setup-lan.bat as Administrator to add the URL ACL.'
-    exit 1
+# ---------------------------------------------------------------------------
+# BIND -- and if the port is taken, MOVE rather than die.
+#
+# The port used to be a hardcoded 8080, the one setting here that was not
+# overridable, and 8080 is popular: a mesh coordinator, a dev server, another
+# copy of this script. When it was occupied the failure was ugly in a specific
+# way -- a browser opened on someone ELSE'S 404, so Gobbonet looked like it was
+# running and broken rather than not running at all.
+#
+# So: honour GEMMA_LISTEN_PORT, and if that port cannot be bound because
+# something already holds it, walk to the next free one and SAY SO. A conflict
+# is not the user's mistake and there is nothing to decide -- any free port
+# serves the same pages.
+#
+# An ACL failure is NOT a conflict and must not be retried: binding "http://+:"
+# needs a URL ACL, and walking ports would fail 20 more times and bury the one
+# message that tells you to run setup-lan.bat.
+# ---------------------------------------------------------------------------
+function Test-PortFree([int]$Port) {
+    try {
+        $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $l.Start(); $l.Stop(); return $true
+    } catch { return $false }
 }
 
-Write-Host ("[ok] listening on http://+:{0}/" -f $ListenPort)
+$listener = $null
+$bound    = $false
+$wanted   = $ListenPort
+foreach ($try in $wanted..($wanted + 20)) {
+    if (-not (Test-PortFree $try)) { continue }
+    # Try the LAN prefix first, then loopback.
+    #
+    # "http://+:" binds every interface and needs a URL ACL, which needs
+    # Administrator -- so on a normal account this died with "Access is denied"
+    # and told the user to run setup-lan.bat. But most runs are local: one
+    # person, one machine, a browser on the same box. "http://127.0.0.1:" needs
+    # no ACL and no elevation, and serves that case perfectly.
+    #
+    # So LAN is attempted, and its absence is a WARNING rather than a fatal:
+    # falling back means the app starts for everyone, and the people who
+    # actually want LAN still get told exactly how to get it.
+    $prefixes = @("http://+:$try/", "http://127.0.0.1:$try/")
+    $lastErr  = $null
+    foreach ($prefix in $prefixes) {
+        $candidate = New-Object System.Net.HttpListener
+        $candidate.Prefixes.Add($prefix)
+        try {
+            $candidate.Start()
+            $listener   = $candidate
+            $ListenPort = $try
+            $bound      = $true
+            if ($prefix -like 'http://127.0.0.1:*') {
+                Write-Host '[warn] LAN binding needs a URL ACL (Administrator); serving on loopback only.'
+                Write-Host '       Run setup-lan.bat as Administrator to reach this from other devices.'
+            }
+            break
+        } catch {
+            $lastErr = $_.Exception.Message
+        }
+    }
+    if ($bound) { break }
+}
+if (-not $bound) {
+    Write-Host ("[fatal] no free port in {0}..{1} -- every one was taken or refused." -f $wanted, ($wanted + 20))
+    exit 1
+}
+if ($ListenPort -ne $wanted) {
+    Write-Host ("[warn] port {0} was in use; serving on {1} instead." -f $wanted, $ListenPort)
+}
+# The port a caller must actually open. A launcher cannot guess a port we chose
+# after it started us, and guessing is how a browser lands on a blank tab.
+try {
+    Set-Content -LiteralPath (Join-Path $Root '.gobbonet-port') -Value $ListenPort -Encoding ascii
+} catch { }
+
+# Report the prefix actually bound, not the one we asked for: after a
+# loopback fallback this said "http://+:" while LAN was unreachable.
+Write-Host ("[ok] listening on {0}" -f ($listener.Prefixes -join ', '))
 Write-Host ("[ok] access password required (salted-hash verified; set via launch.bat)")
 Write-Host ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
 if ($LlmApiKey -eq '') {
@@ -1580,6 +1818,94 @@ while ($listener.IsListening) {
             # not llama-server's. Same-origin under /llm keeps the client's
             # LLAMA_URL-relative addressing (and the session cookie) working.
             Handle-Jobs -Request $request -Response $response
+        }
+        elseif ($path -eq '/models-list.json' -or $path -eq '/active-model.json') {
+            # SYNTHESISE THE MODEL LIST when there is no GGUF directory.
+            #
+            # Upstream's launch.bat writes these two files by scanning a folder
+            # of .gguf files. Against any served backend there is no such folder,
+            # so both 404 and the picker renders one dead "Custom GGUF" entry --
+            # the app looks connected and modelless at the same time. The backend
+            # already knows its own models; /v1/models is the endpoint every
+            # OpenAI-compatible server exposes, so ask it.
+            #
+            # A REAL file still wins: a llama.cpp install with a models folder
+            # keeps its own list, and this only fills a gap rather than
+            # overriding anything.
+            # A REAL file wins, served through the SAME path-resolution the
+            # static branch uses -- Resolve-StaticPath is what enforces the
+            # traversal and dot-file rules, so bypassing it here would open a
+            # hole for the sake of two filenames.
+            $onDisk = Resolve-StaticPath -UrlPath $path
+            if ($null -ne $onDisk) {
+                $bytes = [System.IO.File]::ReadAllBytes($onDisk)
+                $response.StatusCode = 200
+                $response.ContentType = 'application/json'
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            } else {
+                $ids = @()
+                try {
+                    $h = @{}
+                    if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
+                    $u = ('http://127.0.0.1:{0}/v1/models' -f $LlmPort)
+                    $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
+                    $ids = ((($r.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id })
+                } catch { }
+                # Offer only what can answer. A dropdown listing models that
+                # cannot reply is the same defect as one that refuses every
+                # choice -- it just fails later and more confusingly. If NOTHING
+                # is live the full list is kept, because an empty picker hides
+                # the problem instead of showing it.
+                $live = @($ids | Where-Object { Test-ModelServes $_ })
+                if ($live.Count -gt 0) { $ids = $live }
+                $active = if ($LlmModel -ne '') { $LlmModel } elseif ($ids.Count -gt 0) { $ids[0] } else { '' }
+                if ($path -eq '/active-model.json') {
+                    $payload = @{
+                        ggufFile = $active; id = $active; name = $active
+                        family = 'served'; maxCtx = 131072; defaultCtx = 24576
+                    }
+                } else {
+                    $payload = @{ models = @( $ids | ForEach-Object {
+                        @{ file = $_; name = $_; id = $_; family = 'served'
+                           thinkingFormat = 'none'; active = ($_ -eq $active) } } ) }
+                }
+                Write-Json $response 200 $payload
+            }
+        }
+
+        elseif ($path -eq '/llm/health') {
+            # BACKEND-AGNOSTIC HEALTH.
+            #
+            # The client asks /llm/health and expects llama.cpp's {"status":"ok"}.
+            # Proxied straight through, that 404s against ANY other
+            # OpenAI-compatible server -- Ollama, vLLM, a gateway -- none of
+            # which serve /health. The UI then shows "Error: HTTP 404" and
+            # "OFFLINE -- run launch.bat" while a perfectly good backend sits
+            # there answering /v1/chat/completions, which is the ONLY endpoint
+            # this app actually generates with (see line ~821).
+            #
+            # So: ask /health, and if that is not there ask /v1/models, which is
+            # the one endpoint every OpenAI-compatible server does serve. Either
+            # answer means the same thing to the caller -- something is up and
+            # can generate -- so it is reported in the shape the client already
+            # understands rather than making the client learn a second one.
+            $ok = $false
+            foreach ($probe in @('/health', '/v1/models')) {
+                try {
+                    $u = ('http://127.0.0.1:{0}{1}' -f $LlmPort, $probe)
+                    $h = @{}; if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
+                    $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 4 -UseBasicParsing -ErrorAction Stop
+                    if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300) { $ok = $true; break }
+                } catch { }
+            }
+            $body = if ($ok) { '{"status":"ok"}' } else { '{"status":"unavailable"}' }
+            $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+            $response.StatusCode  = if ($ok) { 200 } else { 503 }
+            $response.ContentType = 'application/json'
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.OutputStream.Close()
         }
         elseif ($path -eq '/llm' -or $path -like '/llm/*') {
             Invoke-Proxy -Request $request -Response $response -Prefix '/llm' -UpstreamPort $LlmPort -InjectLlmKey $true
