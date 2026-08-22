@@ -269,6 +269,30 @@ A handful of models are built on the Tekken tokenizer, and those don't run corre
 
 ---
 
+## Upcoming changes
+
+Same honesty policy as the bug list: here's what's actually queued, and roughly when we expect it to land. No dates promised — this is a list of intent, not a contract.
+
+Between 1.5.8 and 1.6
+- PDF handling — attach a PDF and have the AI actually read it, rather than being limited to plain text.
+- Mac / Linux / Android port — GobboNet is Windows-only today. This is the work that changes that.
+- Model list moves to a GoblinCorps web call — the download menu currently ships with a fixed list baked into the files. Pulling it from our site instead means new and better models can show up in your menu without you reinstalling anything. We’ll be using an ‘add model’ button in the config menu that’ll let you download more models directly from huggingface.
+
+Between 1.6 and v2.0
+- Security update — a general pass over how the app protects itself and your data.
+- Cloud complement — optional support for cloud models, shipped as a mod rather than baked into the app, because the whole service should stay private unless you explicitly say otherwise.
+- Temperature / top-k on the carousel — save response settings alongside each system prompt, so swapping prompts also swaps the feel of the replies. More variance between them without hand-tuning every time.
+- Canvas side panel — a proper side panel for long code blocks and documents, with syntax highlighting, instead of everything being crammed into a chat bubble.
+- Auto-swipe on a bad entry — if a reply trips a banned word, reroll it automatically instead of making you do it by hand.
+- Optional flags on all fields — per-field toggles across the app. Honest note: this one may turn out redundant, and we'll drop it if it does.
+- Smoother alternate greetings — make moving between a character's different opening lines feel less clunky.
+- Undo button — take back the last thing you did.
+- Group chat — more than one character in the same conversation.
+- User-controlled information hierarchy — you decide what gets sent to the model first, and what gets pushed down the list when space runs short.
+- TTS / STT — speak to it, and have it speak back.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
@@ -354,6 +378,12 @@ Everything GobboNet can do, grouped so it's easy to scan.
 
 **Devices**
 - PC-to-phone connection — use the same chat from your phone or tablet over your home Wi-Fi.
+
+---
+
+## How I handle PRs. 
+
+I'm one highly paranoid goblin and I ship a .exe that non-technical people install, so I need to understand every line that goes out. In practice that means I often reimplement a fix in my own code rather than merging the patch **especially** for security issues. You'll be credited as co-author on the commit and named in the release notes. If I close your PR, it usually means it shipped, not that it was rejected. Bug reports and security findings are hugely welcome even if you don't write a line of code.
 
 ---
 

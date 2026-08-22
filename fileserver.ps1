@@ -3,7 +3,7 @@
 #
 # Responsibilities:
 #   1. Serve static files (chat.html, style.css, active-model.json, models-list.json, etc.)
-#      from the project root on http://+:8080/.
+#      from the project root on http://+:9066/ by default.
 #   2. Reverse-proxy /llm/*    -> http://127.0.0.1:$LlmPort     (llama-server)
 #                   /search/*  -> http://127.0.0.1:$SearchPort  (Ollama search proxy)
 #                   /embed/*   -> http://127.0.0.1:$EmbedPort   (embedding llama-server, optional)
@@ -47,30 +47,126 @@ function Get-EnvOrDefault {
 
 $Root         = Get-EnvOrDefault 'GEMMA_ROOT'           (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $LlmPort      = [int](Get-EnvOrDefault 'GEMMA_LLM_PORT'      '11434')
-# The model NAME to ask the backend for.
-#
-# The client hardcodes {"model":"local"} because llama-server serves exactly
-# one model and ignores the field. Every other OpenAI-compatible backend -- a
-# gateway, vLLM, anything multi-model -- looks the name up and REJECTS 'local',
-# so generation fails against a server that is otherwise working perfectly.
-# When this is set the proxy rewrites the field; unset, the body passes through
-# byte-for-byte and upstream behaviour is unchanged.
-$LlmModel     = Get-EnvOrDefault 'GEMMA_LLM_MODEL'     ''
 $SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
-# PATCHED (Aitherium fork, 2026-08-21): env-driven like every other setting
-# here. Upstream hardcodes 8080; on this machine that port belongs to the
-# mesh coordinator, so the app could not start at all and the only signal
-# was a 404 from the service that already had it. Defaults to 8080, so
-# nothing changes for anyone whose 8080 is free.
-$ListenPort   = [int](Get-EnvOrDefault 'GEMMA_LISTEN_PORT' '8080')
+# Listen port. Default 9066 ("gobb" on a keypad).
+#
+# It was 8080, which was a bad neighbour: 8080 is the most contended port
+# on a developer machine, and Hyper-V, WSL2, Docker Desktop and the Windows
+# NAT service reserve dynamic blocks that swallow it. Anyone running Tomcat,
+# Jenkins or almost any tutorial dev server had to shut GobboNet down to get
+# their own work started.
+#
+# Resolution order matches launch.bat exactly. It is duplicated here rather
+# than assumed, because this script can be started directly -- during
+# debugging, or by someone who never uses the launcher -- and a server that
+# silently picks a different port from the launcher is worse than one that
+# fails to start.
+#   1. GEMMA_LISTEN_PORT   (launch.bat always sets this)
+#   2. .gobbonet-port      (written by the installer)
+#   3. 9066
+$ListenPort = 0
+if ($env:GEMMA_LISTEN_PORT) {
+    [void][int]::TryParse($env:GEMMA_LISTEN_PORT, [ref]$ListenPort)
+}
+if ($ListenPort -le 0) {
+    $portFile = Join-Path $Root '.gobbonet-port'
+    if (Test-Path -LiteralPath $portFile) {
+        try {
+            $raw = (Get-Content -LiteralPath $portFile -TotalCount 1 -ErrorAction Stop).Trim()
+            [void][int]::TryParse($raw, [ref]$ListenPort)
+        } catch { $ListenPort = 0 }
+    }
+}
+# Upper bound 32767, not 65535: Windows allocates ephemeral client ports
+# from 49152 up, and the dynamic ranges Hyper-V/WSL2/Docker reserve sit in
+# the high tens of thousands. A listener up there can lose a race to an
+# outbound socket, which shows up as an intermittent bind failure that is
+# very hard to diagnose. Staying below 32768 avoids the whole class.
+if ($ListenPort -lt 1024 -or $ListenPort -gt 32767) { $ListenPort = 9066 }
+$ListenPrefix = $(if ($env:GEMMA_LISTEN_PREFIX) { $env:GEMMA_LISTEN_PREFIX } else { 'http://+:{0}/' -f $ListenPort })
+
+# ---------------------------------------------------------------------------
+# Startup log.
+#
+# launch.bat starts this script with -WindowStyle Hidden, so every diagnostic
+# below has been written to a console nobody can see. On a failure the user
+# got launch.bat's generic guess instead of the specific reason this script
+# already knew. Everything from here to "listening" is mirrored to disk so
+# launch.bat can print it, and so a bug report can include it.
+#
+# Written to $Root rather than %TEMP% so it sits beside the app, next to the
+# other logs, and is removed by the uninstaller with them.
+# ---------------------------------------------------------------------------
+$StartupLog = Join-Path $Root 'fileserver.log'
+try { Remove-Item -LiteralPath $StartupLog -Force -ErrorAction SilentlyContinue } catch { }
+function Say {
+    param([string]$Msg, [string]$Colour = 'Gray')
+    try { Write-Host $Msg -ForegroundColor $Colour } catch { Write-Host $Msg }
+    try { Add-Content -LiteralPath $StartupLog -Value $Msg -ErrorAction SilentlyContinue } catch { }
+}
+Say ("[boot] fileserver starting -- prefix {0}" -f $ListenPrefix)
 $ServerExe    = Get-EnvOrDefault 'GEMMA_SERVER_EXE'     ''
 $ModelDir     = Get-EnvOrDefault 'GEMMA_MODEL_DIR'      (Join-Path $Root 'models')
-$CtxSize      = [int](Get-EnvOrDefault 'GEMMA_CTX_SIZE'      '16384')
-$GpuLayers    = [int](Get-EnvOrDefault 'GEMMA_GPU_LAYERS'    '99')
-$KvCacheType  = Get-EnvOrDefault 'GEMMA_KV_CACHE_TYPE'  'q8_0'
+# ---------------------------------------------------------------------------
+# llama-server tuning.
+#
+# launch.bat picks these from the detected hardware and the chosen model,
+# and they were unreachable after that -- to try a different KV cache type
+# or push layers off the GPU you had to edit a .bat file and restart
+# everything. That is a reasonable default and a bad ceiling: the auto
+# guess cannot know that you also game on this machine, or that you would
+# rather trade context for speed.
+#
+# .gobbonet-perf.json overrides them, and is written by the config panel.
+# The values from launch.bat stay the AUTO baseline the panel shows and
+# resets to, so "put it back how it was" is always one click away.
+# ---------------------------------------------------------------------------
+$AutoCtxSize     = [int](Get-EnvOrDefault 'GEMMA_CTX_SIZE'      '16384')
+$AutoGpuLayers   = [int](Get-EnvOrDefault 'GEMMA_GPU_LAYERS'    '99')
+$AutoKvCacheType = Get-EnvOrDefault 'GEMMA_KV_CACHE_TYPE'  'q8_0'
+
+$PerfFile = Join-Path $Root '.gobbonet-perf.json'
+
+$CtxSize     = $AutoCtxSize
+$GpuLayers   = $AutoGpuLayers
+$KvCacheType = $AutoKvCacheType
+
+# Every value is validated on load, not just on save. The file is plain
+# JSON in the install folder and editing it by hand is a supported thing to
+# do, so it has to survive someone typing 'yes' where a number goes without
+# taking llama-server down with an unreadable argument error.
+function Read-PerfOverrides {
+    if (-not (Test-Path -LiteralPath $script:PerfFile)) { return }
+    try {
+        $p = Get-Content -LiteralPath $script:PerfFile -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        Say ("[warn] .gobbonet-perf.json is not valid JSON -- using auto values. {0}" -f $_.Exception.Message) 'Yellow'
+        return
+    }
+
+    $n = 0
+    if ($p.ctxSize -ne $null -and [int]::TryParse([string]$p.ctxSize, [ref]$n)) {
+        # 512 is below anything usable; 1048576 is past any current model.
+        if ($n -ge 512 -and $n -le 1048576) { $script:CtxSize = $n }
+        else { Say ("[warn] perf ctxSize {0} out of range -- keeping {1}" -f $n, $script:CtxSize) 'Yellow' }
+    }
+    if ($p.gpuLayers -ne $null -and [int]::TryParse([string]$p.gpuLayers, [ref]$n)) {
+        # 0 = pure CPU, which is a legitimate choice on a machine whose GPU
+        # is busy. 99 is llama.cpp's idiom for "all of them".
+        if ($n -ge 0 -and $n -le 999) { $script:GpuLayers = $n }
+        else { Say ("[warn] perf gpuLayers {0} out of range -- keeping {1}" -f $n, $script:GpuLayers) 'Yellow' }
+    }
+    if ($p.kvCacheType) {
+        $kv = [string]$p.kvCacheType
+        if ($kv -in @('f16','q8_0','q4_0')) { $script:KvCacheType = $kv }
+        else { Say ("[warn] perf kvCacheType '{0}' unknown -- keeping {1}" -f $kv, $script:KvCacheType) 'Yellow' }
+    }
+    Say ("[ok] tuning overrides: ctx={0} gpuLayers={1} kv={2}" -f $script:CtxSize, $script:GpuLayers, $script:KvCacheType)
+}
+Read-PerfOverrides
 $LogFile      = Get-EnvOrDefault 'GEMMA_LOG_FILE'       (Join-Path $Root 'llama-server.log')
 $LaunchScript = Get-EnvOrDefault 'GEMMA_LAUNCH_SCRIPT'  (Join-Path $Root '.llama-launch.cmd')
 
@@ -86,12 +182,23 @@ $ActiveJson   = Join-Path $Root 'active-model.json'
 # timer, deleted on client ack.
 $JobsDir          = Join-Path $Root '.jobs'
 $JobMaxAgeHours   = 48    # retention backstop if a client never acks
-$JobMaxConcurrent = 4     # llama-server runs --parallel 1; extras just queue
+# One. The old value was 4, with a comment reading "llama-server runs
+# --parallel 1; extras just queue" -- which described the bug rather than
+# defending the number. llama-server does queue them, and that queue is
+# exactly the reported symptom: press Stop, start another generation, and
+# the new one sits behind a request that is still running because
+# llama-server has not noticed the disconnect yet. Do it a few more times
+# and four stacked generations fight over one slot until they all drain.
+#
+# The app has always been one-generation-at-a-time (see the note in
+# 03-generation.js). The server now enforces that instead of permitting a
+# backlog it cannot serve.
+$JobMaxConcurrent = 1
 $Script:JobWorkers = @{}  # jobId -> @{ PS; Handle; Runspace } for live runspaces
 
 # --- Access control ----------------------------------------------------------
 # A single shared password gates the whole server. Anyone on the LAN can REACH
-# port 8080 (the firewall only restricts to LocalSubnet), so a roommate, guest,
+# the web UI port (the firewall only restricts to LocalSubnet), so a roommate, guest,
 # or compromised IoT device on the same Wi-Fi could otherwise read/write chats,
 # drive the GPU, and swap models. Requiring a password closes that gap.
 #
@@ -115,8 +222,15 @@ if ($AccessSecret -match '^([0-9a-fA-F]+):([0-9a-fA-F]+)$') {
     $AccessHash = $Matches[2].ToLower()
 }
 if ($AccessHash -eq '') {
-    Write-Host "[FATAL] No access secret provided (GEMMA_ACCESS_SECRET missing or malformed)." -Foreground Red
-    Write-Host "        Run launch.bat -- it sets the password on first run. Exiting." -Foreground Red
+    # This is exit #1 of four, and the one nobody guesses, because it fires
+    # before the listener is ever touched -- so every "it must be a port or
+    # permission problem" instinct is wrong for it. Say it plainly.
+    Say "[FATAL] No access secret provided (GEMMA_ACCESS_SECRET missing or malformed)." 'Red'
+    Say "        This is NOT a port or firewall problem -- the server exited" 'Red'
+    Say "        before it tried to listen." 'Red'
+    Say ("        Check .gobbonet-secret in {0} -- it must be one line of" -f $Root) 'Red'
+    Say "        <hex>:<hex> with no trailing newline. If it is empty or" 'Red'
+    Say "        truncated, delete it and run launch.bat to set a new password." 'Red'
     exit 1
 }
 $LlmApiKey = Get-EnvOrDefault 'GEMMA_LLM_API_KEY' ''
@@ -248,6 +362,34 @@ function Write-FileUtf8 {
 function Write-FileAscii {
     param([string]$Path, [string]$Content)
     [System.IO.File]::WriteAllText($Path, $Content, [System.Text.Encoding]::ASCII)
+}
+
+# Make a short identifier safe to place inside a double-quoted argument of a
+# generated .cmd. A '"' closes the quoting and lets & | < > ^ chain a second
+# command; CR/LF appends a whole new line to the script. Model ids, template
+# names and cache-type flags never legitimately contain any of these, so strip
+# rather than escape -- there is no quoting scheme cmd.exe honours consistently.
+function ConvertTo-CmdArgSafe([string]$s) {
+    if (-not $s) { return '' }
+    $t = $s -replace '[\r\n]', ' '
+    return ($t -replace '[%!^&<>|"]', '').Trim()
+}
+
+# Same job, for a FILESYSTEM PATH, and deliberately gentler.
+#
+# ConvertTo-CmdArgSafe above would strip & % ^ ! -- and all four are LEGAL in
+# Windows paths. Running a path through it silently corrupts any install under
+# a folder like "Models & Templates", or a username containing '!', and the
+# failure surfaces as llama-server refusing a template file that plainly exists.
+#
+# Inside a double-quoted argument the shell metacharacters & | < > are already
+# inert, and the generated .cmd does not enable delayed expansion, so a bare '!'
+# is literal there too. That leaves exactly two characters that can break out of
+# the quoting: '"' and CR/LF. Both are ILLEGAL in Windows filenames, so removing
+# them costs nothing legitimate and closes the hole completely.
+function ConvertTo-CmdPathSafe([string]$s) {
+    if (-not $s) { return '' }
+    return (($s -replace '[\r\n]', ' ') -replace '"', '').Trim()
 }
 
 # --- Auth helpers ------------------------------------------------------------
@@ -649,7 +791,10 @@ function Read-JobStatus {
 }
 
 # Reap finished worker runspaces so handles don't pile up across a long
-# uptime. Called opportunistically from Handle-Jobs.
+# uptime. Called from the main request loop, not just from Handle-Jobs:
+# a user who presses Stop and then closes the tab sends no further job
+# requests, and reaping only on job traffic left that runspace alive until
+# something else happened to ask for one.
 function Remove-CompletedJobWorkers {
     $done = @()
     foreach ($id in @($Script:JobWorkers.Keys)) {
@@ -658,11 +803,68 @@ function Remove-CompletedJobWorkers {
     }
     foreach ($id in $done) {
         $w = $Script:JobWorkers[$id]
-        try { $w.PS.EndInvoke($w.Handle) } catch { }
+        # $null = : EndInvoke returns the runspace's output stream. Left
+        # unswallowed it leaks into whatever called this, and since
+        # Stop-LiveJobWorkers now returns a boolean the caller tests, a
+        # worker that happened to emit anything would turn that boolean
+        # into an array.
+        try { $null = $w.PS.EndInvoke($w.Handle) } catch { }
         try { $w.PS.Dispose() } catch { }
         try { $w.Runspace.Dispose() } catch { }
         $Script:JobWorkers.Remove($id)
     }
+}
+
+# Ask every live worker to stop, and wait a bounded time for them to go.
+#
+# Returns $true if the field is clear. The wait matters more than it looks:
+# the point is to have the old HTTP connection genuinely torn down BEFORE
+# the next request reaches llama-server, so llama-server sees the
+# disconnect, frees its single slot, and the new generation starts on an
+# idle server instead of queueing behind a corpse.
+function Stop-LiveJobWorkers {
+    param([int]$TimeoutMs = 2500)
+
+    $live = @()
+    foreach ($id in @($Script:JobWorkers.Keys)) {
+        if (-not $Script:JobWorkers[$id].Handle.IsCompleted) { $live += $id }
+    }
+    if ($live.Count -eq 0) { return $true }
+
+    foreach ($id in $live) {
+        # The flag is what the worker polls; writing it here means a
+        # superseded job dies even if the client never sent a cancel --
+        # a closed tab, a reload mid-generation, a crashed browser.
+        $p = Get-JobPaths $id
+        try { if (-not (Test-Path $p.Cancel)) { Set-Content -LiteralPath $p.Cancel -Value '1' -Encoding ascii } } catch { }
+        Say ("[jobs] superseding {0} -- cancel requested" -f $id)
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        $stillLive = 0
+        foreach ($id in $live) {
+            if ($Script:JobWorkers.ContainsKey($id) -and -not $Script:JobWorkers[$id].Handle.IsCompleted) { $stillLive++ }
+        }
+        if ($stillLive -eq 0) { Remove-CompletedJobWorkers; return $true }
+        Start-Sleep -Milliseconds 100
+    }
+
+    # Refused to die inside the window. Stop the runspace outright: an
+    # abandoned worker holding a socket open is the exact thing that makes
+    # the next generation crawl, and a hard stop is better than politely
+    # letting it keep the slot.
+    foreach ($id in $live) {
+        if ($Script:JobWorkers.ContainsKey($id) -and -not $Script:JobWorkers[$id].Handle.IsCompleted) {
+            Say ("[jobs] worker {0} did not stop in {1}ms -- forcing" -f $id, $TimeoutMs) 'Yellow'
+            try { $Script:JobWorkers[$id].PS.Stop() } catch { }
+            try { $Script:JobWorkers[$id].PS.Dispose() } catch { }
+            try { $Script:JobWorkers[$id].Runspace.Dispose() } catch { }
+            $Script:JobWorkers.Remove($id)
+            try { Write-FileUtf8 (Get-JobPaths $id).Status (@{ status = 'cancelled' } | ConvertTo-Json -Compress) } catch { }
+        }
+    }
+    return $false
 }
 
 # The worker body. Runs in its own runspace with NO shared state -- everything
@@ -739,7 +941,6 @@ $Script:JobWorkerScript = {
                         [System.IO.FileAccess]::Write,
                         [System.IO.FileShare]::ReadWrite)
         $buf = New-Object byte[] 8192
-        $pending = ''   # partial SSE line carried across reads
         try {
             while ($true) {
                 if (Test-Path $CancelPath) { $cancelled = $true; break }
@@ -754,65 +955,8 @@ $Script:JobWorkerScript = {
                 if ($cancelled) { break }
                 $n = $task.Result
                 if ($n -le 0) { break }
-
-                # TRANSLATE NATIVE EVENTS TO OPENAI CHUNKS.
-                #
-                # The client reads choices[0].delta.content -- the OpenAI shape.
-                # A llama-server speaks that natively, but a platform gateway may
-                # answer in its OWN framing:
-                #
-                #     event: token
-                #     data: {"t": "Hello", "n": 1, "type": "token"}
-                #
-                # which parses fine, contains the reply, and yields NOTHING at
-                # choices[0].delta.content. Measured 2026-08-21: the model
-                # answered in under a second and the UI rendered "<1s -- no
-                # response", with the text sitting in the spool the whole time.
-                # Worse, it varied BY MODEL -- one route passed OpenAI chunks
-                # through and another did not -- so it read as a flaky backend
-                # rather than a format mismatch.
-                #
-                # Line-aware, because a read boundary can split a frame in half.
-                # Anything unrecognised passes through unchanged, so a real
-                # OpenAI stream is untouched and this can only add support.
-                $pending += [Text.Encoding]::UTF8.GetString($buf, 0, $n)
-                $emit = ''
-                while ($true) {
-                    $ix = $pending.IndexOf("`n")
-                    if ($ix -lt 0) { break }
-                    $line = $pending.Substring(0, $ix).TrimEnd("`r")
-                    $pending = $pending.Substring($ix + 1)
-                    $outLine = $line
-                    if ($line.StartsWith('event: ')) {
-                        $outLine = $null            # native framing; OpenAI has none
-                    } elseif ($line.StartsWith('data: ')) {
-                        $payload = $line.Substring(6)
-                        if ($payload -ne '[DONE]') {
-                            try {
-                                $o = $payload | ConvertFrom-Json
-                                if ($o.type -eq 'token' -and $null -ne $o.t) {
-                                    $chunk = @{
-                                        id = 'chatcmpl-adapter'
-                                        object = 'chat.completion.chunk'
-                                        model = 'local'
-                                        choices = @(@{ index = 0
-                                                       delta = @{ content = [string]$o.t }
-                                                       finish_reason = $null })
-                                    } | ConvertTo-Json -Depth 8 -Compress
-                                    $outLine = 'data: ' + $chunk
-                                } elseif ($o.type -eq 'complete' -or $o.type -eq 'done') {
-                                    $outLine = 'data: [DONE]'
-                                }
-                            } catch { }
-                        }
-                    }
-                    if ($null -ne $outLine) { $emit += $outLine + "`n" }
-                }
-                if ($emit -ne '') {
-                    $eb = [Text.Encoding]::UTF8.GetBytes($emit)
-                    $outStream.Write($eb, 0, $eb.Length)
-                    $outStream.Flush()
-                }
+                $outStream.Write($buf, 0, $n)
+                $outStream.Flush()
             }
         } finally {
             try { $outStream.Close() } catch { }
@@ -852,29 +996,35 @@ function Handle-Jobs {
             return
         }
 
-        # Concurrency cap. llama-server (--parallel 1) queues extras anyway;
-        # this just stops a misbehaving client from stacking workers.
-        $live = 0
-        foreach ($id in @($Script:JobWorkers.Keys)) {
-            if (-not $Script:JobWorkers[$id].Handle.IsCompleted) { $live++ }
-        }
-        if ($live -ge $JobMaxConcurrent) {
-            Write-Json $Response 429 @{ error = ('too many generations in flight ({0}); try again shortly' -f $live) }
-            return
+        # Supersede, do not queue.
+        #
+        # This used to answer 429 once four workers were live. Both halves of
+        # that were wrong. Four is more than llama-server can serve, so the
+        # extras piled into its single slot; and a 429 to someone who just
+        # pressed Send is a refusal, when what they plainly want is the new
+        # generation and not the old one.
+        #
+        # So: cancel whatever is running, wait for it to actually let go of
+        # the socket, and only then dispatch. The wait is the important part.
+        # llama-server frees its slot when it notices the disconnect, and if
+        # we dispatch before that happens the new request queues behind a
+        # generation nobody is reading -- which is precisely the stall this
+        # is meant to remove.
+        #
+        # The wait is bounded tightly because this accept loop is
+        # single-threaded: while we sit here, the server answers nothing
+        # else -- no static files, no status polls. 2.5s is the ceiling on
+        # that stall, and it is only ever reached by a worker that ignored
+        # its cancel flag, which is already a broken state. The normal path
+        # is ~200ms, and usually zero, because the client sent its own
+        # cancel the moment Stop was pressed.
+        $cleared = Stop-LiveJobWorkers -TimeoutMs 2500
+        if (-not $cleared) {
+            Say '[jobs] previous worker ignored its cancel flag and was force-stopped' 'Yellow'
         }
 
         $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
         $body = $reader.ReadToEnd()
-        if ($LlmModel -ne '') {
-            # Swap the placeholder for a name the backend actually serves. Done
-            # here rather than in the client, so the browser keeps working
-            # unchanged against a plain llama-server.
-            try {
-                $o = $body | ConvertFrom-Json
-                $o.model = $LlmModel
-                $body = $o | ConvertTo-Json -Depth 20 -Compress
-            } catch { }
-        }
         $reader.Close()
         try { $null = $body | ConvertFrom-Json } catch {
             Write-Json $Response 400 @{ error = 'body is not valid JSON' }
@@ -1160,8 +1310,8 @@ function Build-LaunchScript {
         '--host',      '127.0.0.1',
         '--ctx-size',  "$CtxSize",
         '--n-gpu-layers', "$GpuLayers",
-        '--cache-type-k', $KvCacheType,
-        '--cache-type-v', $KvCacheType,
+        '--cache-type-k', (ConvertTo-CmdArgSafe $KvCacheType),
+        '--cache-type-v', (ConvertTo-CmdArgSafe $KvCacheType),
         '--parallel',  '1'
     )
     
@@ -1173,9 +1323,15 @@ function Build-LaunchScript {
     # makes llama-server treat the path text itself as a literal template.
     if ($chatTemplateFile -ne '') {
         $sidecarAbs = if ([System.IO.Path]::IsPathRooted($chatTemplateFile)) { $chatTemplateFile } else { Join-Path $Root $chatTemplateFile }
-        $argList += @('--chat-template-file', ('"{0}"' -f $sidecarAbs))
+        # Path-safe, not arg-safe: see ConvertTo-CmdPathSafe. Stripping '&' from
+        # a real install path is a bug, not a hardening.
+        $argList += @('--chat-template-file', ('"{0}"' -f (ConvertTo-CmdPathSafe $sidecarAbs)))
     } elseif ($chatTemplate) {
-        $argList += @('--chat-template', $chatTemplate)
+        # Quoted AND scrubbed: this line is written into a .cmd and executed, so
+        # an unquoted value carrying '&' would chain a second command. The values
+        # identify-model.ps1 emits are allowlisted literals, but models-list.json
+        # is a file on disk and this is the last gate before it becomes a command.
+        $argList += @('--chat-template', ('"{0}"' -f (ConvertTo-CmdArgSafe $chatTemplate)))
     }
 
     $argList += @('--reasoning-format', 'auto')
@@ -1349,53 +1505,154 @@ function Update-ModelsListActive {
 # Handle POST /swap-model. Kicks off the swap, returns 202 immediately.
 # The actual readiness check happens lazily in /swap-status when the
 # client polls.
+function Handle-Search {
+    param($Request, $Response, [string]$SubPath)
+
+    # Web search, served directly instead of through a second process.
+    #
+    # This used to be a separate PowerShell started from launch.bat with
+    # -EncodedCommand and a 4,656-character base64 blob: a hidden-window
+    # process, execution policy bypassed, opening a listener and relaying
+    # authenticated traffic to an external host. That is indistinguishable in
+    # shape from a command-and-control relay, and antivirus weights encoded
+    # PowerShell heavily and largely regardless of payload, because ordinary
+    # software almost never does it.
+    #
+    # Nothing about the behaviour changes here. The same request goes to the
+    # same place with the same header. What goes away is a process, a port, a
+    # retry loop, a failure mode, and the single strongest malware signal in
+    # the project. launch.bat already carries comments (see :llama_download and
+    # the embed download) explaining why this pattern was removed elsewhere;
+    # the search path had kept a worse version of it.
+
+    if ($SubPath -eq '/health' -or $SubPath -eq '') {
+        # Same body the standalone proxy returned, because :http_alive in
+        # launch.bat matches on "status" and the client checks this before
+        # every search.
+        Write-Json $Response 200 @{ status = 'ok' }
+        return
+    }
+
+    $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd(); $reader.Close()
+
+    $target = 'https://ollama.com/api' + $SubPath
+    $headers = @{ 'Content-Type' = 'application/json' }
+
+    # The client sends its own Authorization for the search API. That header is
+    # the user's search credential and has nothing to do with this server's
+    # session cookie, so it is forwarded verbatim -- collapsing the two hops
+    # must not silently drop it, or search fails with an upstream 401 that
+    # looks like a proxy bug.
+    $auth = $Request.Headers['Authorization']
+    if ($auth) { $headers['Authorization'] = $auth }
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $wr = Invoke-WebRequest -Uri $target -Method POST -Body $body `
+                                -Headers $headers -UseBasicParsing -TimeoutSec 30
+        Write-Text $Response 200 'application/json' $wr.Content
+    } catch {
+        $msg = $_.Exception.Message -replace '"','' -replace "`r",'' -replace "`n",' '
+        Write-Json $Response 502 @{ error = ('search: ' + $msg) }
+    }
+}
+
+function Handle-Perf {
+    param($Request, $Response)
+
+    if ($Request.HttpMethod -eq 'GET') {
+        # Hand back both the live values and the auto baseline, so the panel
+        # can show "you set 8192, auto would pick 16384" rather than a
+        # number with no context. Sending maxCtx too lets the client cap its
+        # own input instead of letting llama-server fail obscurely later.
+        $maxCtx = 0
+        if (Test-Path -LiteralPath $script:ActiveJson) {
+            try { $maxCtx = [int](Get-Content -LiteralPath $script:ActiveJson -Raw | ConvertFrom-Json).maxCtx } catch { }
+        }
+        Write-Json $Response 200 @{
+            current   = @{ ctxSize = $script:CtxSize;     gpuLayers = $script:GpuLayers;     kvCacheType = $script:KvCacheType }
+            auto      = @{ ctxSize = $script:AutoCtxSize; gpuLayers = $script:AutoGpuLayers; kvCacheType = $script:AutoKvCacheType }
+            overridden = (Test-Path -LiteralPath $script:PerfFile)
+            modelMaxCtx = $maxCtx
+        }
+        return
+    }
+
+    if ($Request.HttpMethod -ne 'POST') {
+        Write-Json $Response 405 @{ error = 'GET or POST only' }
+        return
+    }
+
+    $reader = New-Object System.IO.StreamReader($Request.InputStream, [System.Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd(); $reader.Close()
+    try { $b = $body | ConvertFrom-Json } catch {
+        Write-Json $Response 400 @{ error = 'Body is not valid JSON.' }
+        return
+    }
+
+    # "reset" deletes the file rather than writing the auto values into it.
+    # Writing them would freeze today's guess forever -- swap to a bigger
+    # model and the stale numbers would still be in force.
+    if ($b.reset) {
+        try { Remove-Item -LiteralPath $script:PerfFile -Force -ErrorAction SilentlyContinue } catch { }
+        $script:CtxSize     = $script:AutoCtxSize
+        $script:GpuLayers   = $script:AutoGpuLayers
+        $script:KvCacheType = $script:AutoKvCacheType
+        Say '[perf] reset to auto values'
+        Write-Json $Response 200 @{
+            ok = $true; reset = $true
+            current = @{ ctxSize = $script:CtxSize; gpuLayers = $script:GpuLayers; kvCacheType = $script:KvCacheType }
+        }
+        return
+    }
+
+    $n = 0
+    $newCtx = $script:CtxSize; $newGpu = $script:GpuLayers; $newKv = $script:KvCacheType
+    if ($b.ctxSize -ne $null) {
+        if (-not [int]::TryParse([string]$b.ctxSize, [ref]$n) -or $n -lt 512 -or $n -gt 1048576) {
+            Write-Json $Response 400 @{ error = 'ctxSize must be a number between 512 and 1048576.' }; return
+        }
+        $newCtx = $n
+    }
+    if ($b.gpuLayers -ne $null) {
+        if (-not [int]::TryParse([string]$b.gpuLayers, [ref]$n) -or $n -lt 0 -or $n -gt 999) {
+            Write-Json $Response 400 @{ error = 'gpuLayers must be a number between 0 and 999.' }; return
+        }
+        $newGpu = $n
+    }
+    if ($b.kvCacheType) {
+        if ([string]$b.kvCacheType -notin @('f16','q8_0','q4_0')) {
+            Write-Json $Response 400 @{ error = 'kvCacheType must be f16, q8_0 or q4_0.' }; return
+        }
+        $newKv = [string]$b.kvCacheType
+    }
+
+    $script:CtxSize = $newCtx; $script:GpuLayers = $newGpu; $script:KvCacheType = $newKv
+    $obj = [ordered]@{ ctxSize = $newCtx; gpuLayers = $newGpu; kvCacheType = $newKv }
+    try {
+        Write-FileUtf8 $script:PerfFile ($obj | ConvertTo-Json)
+    } catch {
+        Write-Json $Response 500 @{ error = ('Could not write .gobbonet-perf.json: ' + $_.Exception.Message) }
+        return
+    }
+    Say ("[perf] saved: ctx={0} gpuLayers={1} kv={2}" -f $newCtx, $newGpu, $newKv)
+
+    # Deliberately does NOT restart llama-server. Applying the change reuses
+    # the existing hot-swap path -- the client posts the current model to
+    # /swap-model afterwards -- so there is exactly one restart mechanism in
+    # this codebase, with one lock and one status feed, rather than two that
+    # can race each other.
+    Write-Json $Response 200 @{
+        ok = $true
+        current = $obj
+        note = 'Saved. Applies on the next llama-server start.'
+    }
+}
+
 function Handle-SwapModel {
     param($Request, $Response)
 
-    # SERVED BACKEND: swapping is just changing the name we ask for.
-    #
-    # Hot-swap upstream means killing llama-server, rewriting the launch script
-    # and booting a new GGUF. Against a served backend none of that applies --
-    # the models are already loaded and selection is one field in the request.
-    # Without this branch the picker renders the real roster and then 503s on
-    # every selection, which is a dropdown that exists to disappoint.
-    if ($LlmModel -ne '') {
-        $bodyRaw = ''
-        if ($Request.HasEntityBody) {
-            $sr = New-Object IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
-            $bodyRaw = $sr.ReadToEnd(); $sr.Close()
-        }
-        $want = ''
-        try { $want = ($bodyRaw | ConvertFrom-Json).file } catch { }
-        if ([string]::IsNullOrWhiteSpace($want)) {
-            Write-Json $Response 400 @{ phase = 'error'; message = 'no model named' }
-            return
-        }
-        # Only accept a name the backend actually serves: this value comes from
-        # the client, and it is about to be put in every upstream request.
-        $known = @()
-        try {
-            $h = @{}
-            if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
-            $u = ('http://127.0.0.1:{0}/v1/models' -f $LlmPort)
-            $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
-            $known = ((($r.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id })
-        } catch { }
-        if ($known -notcontains $want) {
-            Write-Json $Response 400 @{ phase = 'error'; message = ("unknown model: {0}" -f $want) }
-            return
-        }
-        # Listed is not serving. Accepting a catalogued-but-dead model is what
-        # turned a swap into a ten-second silence with no reason given.
-        if (-not (Test-ModelServes $want)) {
-            Write-Json $Response 503 @{ phase = 'error'; message =
-                ("{0} is listed but not serving right now -- the backend answered 503. Pick another model." -f $want) }
-            return
-        }
-        $script:LlmModel = $want
-        Write-Json $Response 200 @{ phase = 'ready'; message = ("now using {0}" -f $want) }
-        return
-    }
     if (-not $HotSwapEnabled) {
         Write-Json $Response 503 @{ phase = 'error'; message = 'Hot-swap is not configured. Restart launch.bat.' }
         return
@@ -1507,53 +1764,8 @@ function Handle-SwapModel {
 # "ready" once llama-server's /health endpoint comes back online, so the
 # expensive readiness check only runs when somebody actually cares.
 # Times out at 180 seconds (consistent with the client-side budget).
-# ---------------------------------------------------------------------------
-# Can the backend actually SERVE this model right now?
-#
-# /v1/models is a menu, not liveness. Measured 2026-08-21 against the gateway:
-# it listed six models and THREE of them answered 503 "Inference backend
-# temporarily unavailable" -- so a picker built from the catalogue offered
-# choices that cannot reply, and choosing one produced a turn that sat for ten
-# seconds and rendered "no response...", with nothing anywhere saying why.
-#
-# One token is enough to separate "listed" from "serving", and the answer is
-# cached because this is asked once per list render and once per swap.
-# ---------------------------------------------------------------------------
-$script:LiveModelCache = @{}
-function Test-ModelServes {
-    param([string]$Model)
-    if ($Model -eq '') { return $false }
-    $hit = $script:LiveModelCache[$Model]
-    if ($null -ne $hit -and ((Get-Date) - $hit.At).TotalSeconds -lt 60) { return $hit.Ok }
-    $ok = $false
-    try {
-        $h = @{ 'Content-Type' = 'application/json' }
-        if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
-        $b = @{ model = $Model; messages = @(@{ role = 'user'; content = 'hi' }); max_tokens = 1 } | ConvertTo-Json -Compress
-        $u = ('http://127.0.0.1:{0}/v1/chat/completions' -f $LlmPort)
-        $r = Invoke-WebRequest -Uri $u -Method POST -Headers $h -Body $b -TimeoutSec 20 -UseBasicParsing -ErrorAction Stop
-        $ok = ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300)
-    } catch { $ok = $false }
-    $script:LiveModelCache[$Model] = @{ Ok = $ok; At = (Get-Date) }
-    return $ok
-}
-
 function Handle-SwapStatus {
     param($Request, $Response)
-
-    # SERVED BACKEND: the swap already happened, synchronously.
-    #
-    # /swap-model returns 200 {phase:'ready'} for a served backend -- there is no
-    # GGUF to load, only a name to change -- but the CLIENT does not treat that
-    # as the end. It polls /swap-status until phase == 'ready', and this read the
-    # GGUF swap-status file, which for a served backend never changes and never
-    # will. The poll therefore ran to its timeout and reported "Swap failed:
-    # Timed out waiting for model to load" for a swap that had already succeeded
-    # -- the model WAS switched, and the UI said it failed.
-    if ($LlmModel -ne '') {
-        Write-Json $Response 200 @{ phase = 'ready'; file = $LlmModel; model = $LlmModel }
-        return
-    }
 
     $st = Read-SwapStatus
     if ($null -eq $st) {
@@ -1620,86 +1832,63 @@ function Handle-SwapStatus {
 # Make sure System.Web is available for UrlDecode.
 Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 
-# ---------------------------------------------------------------------------
-# BIND -- and if the port is taken, MOVE rather than die.
-#
-# The port used to be a hardcoded 8080, the one setting here that was not
-# overridable, and 8080 is popular: a mesh coordinator, a dev server, another
-# copy of this script. When it was occupied the failure was ugly in a specific
-# way -- a browser opened on someone ELSE'S 404, so Gobbonet looked like it was
-# running and broken rather than not running at all.
-#
-# So: honour GEMMA_LISTEN_PORT, and if that port cannot be bound because
-# something already holds it, walk to the next free one and SAY SO. A conflict
-# is not the user's mistake and there is nothing to decide -- any free port
-# serves the same pages.
-#
-# An ACL failure is NOT a conflict and must not be retried: binding "http://+:"
-# needs a URL ACL, and walking ports would fail 20 more times and bury the one
-# message that tells you to run setup-lan.bat.
-# ---------------------------------------------------------------------------
-function Test-PortFree([int]$Port) {
-    try {
-        $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
-        $l.Start(); $l.Stop(); return $true
-    } catch { return $false }
-}
-
+# Construction and binding are separated on purpose. They fail for entirely
+# different reasons and the old single catch reported both as "could not
+# bind ... run setup-lan.bat as Administrator", which sent people hunting
+# for a URL ACL when the real cause was a reserved port range or a
+# restricted PowerShell language mode.
 $listener = $null
-$bound    = $false
-$wanted   = $ListenPort
-foreach ($try in $wanted..($wanted + 20)) {
-    if (-not (Test-PortFree $try)) { continue }
-    # Try the LAN prefix first, then loopback.
-    #
-    # "http://+:" binds every interface and needs a URL ACL, which needs
-    # Administrator -- so on a normal account this died with "Access is denied"
-    # and told the user to run setup-lan.bat. But most runs are local: one
-    # person, one machine, a browser on the same box. "http://127.0.0.1:" needs
-    # no ACL and no elevation, and serves that case perfectly.
-    #
-    # So LAN is attempted, and its absence is a WARNING rather than a fatal:
-    # falling back means the app starts for everyone, and the people who
-    # actually want LAN still get told exactly how to get it.
-    $prefixes = @("http://+:$try/", "http://127.0.0.1:$try/")
-    $lastErr  = $null
-    foreach ($prefix in $prefixes) {
-        $candidate = New-Object System.Net.HttpListener
-        $candidate.Prefixes.Add($prefix)
-        try {
-            $candidate.Start()
-            $listener   = $candidate
-            $ListenPort = $try
-            $bound      = $true
-            if ($prefix -like 'http://127.0.0.1:*') {
-                Write-Host '[warn] LAN binding needs a URL ACL (Administrator); serving on loopback only.'
-                Write-Host '       Run setup-lan.bat as Administrator to reach this from other devices.'
-            }
-            break
-        } catch {
-            $lastErr = $_.Exception.Message
-        }
-    }
-    if ($bound) { break }
-}
-if (-not $bound) {
-    Write-Host ("[fatal] no free port in {0}..{1} -- every one was taken or refused." -f $wanted, ($wanted + 20))
+try {
+    $listener = New-Object System.Net.HttpListener
+} catch {
+    Say ("[fatal] cannot create System.Net.HttpListener -- {0}" -f $_.Exception.Message) 'Red'
+    Say  "        PowerShell is in a restricted language mode (WDAC / AppLocker)." 'Red'
+    Say ("        LanguageMode = {0}" -f $ExecutionContext.SessionState.LanguageMode) 'Red'
+    Say  "        setup-lan.bat cannot fix this. It is a machine policy." 'Red'
     exit 1
 }
-if ($ListenPort -ne $wanted) {
-    Write-Host ("[warn] port {0} was in use; serving on {1} instead." -f $wanted, $ListenPort)
-}
-# The port a caller must actually open. A launcher cannot guess a port we chose
-# after it started us, and guessing is how a browser lands on a blank tab.
-try {
-    Set-Content -LiteralPath (Join-Path $Root '.gobbonet-port') -Value $ListenPort -Encoding ascii
-} catch { }
 
-# Report the prefix actually bound, not the one we asked for: after a
-# loopback fallback this said "http://+:" while LAN was unreachable.
-Write-Host ("[ok] listening on {0}" -f ($listener.Prefixes -join ', '))
-Write-Host ("[ok] access password required (salted-hash verified; set via launch.bat)")
-Write-Host ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
+$BoundPrefix = $null
+try {
+    $listener.Prefixes.Add($ListenPrefix)
+    $listener.Start()
+    $BoundPrefix = $ListenPrefix
+} catch {
+    $wildErr = $_.Exception.Message
+    Say ("[warn] could not bind {0} -- {1}" -f $ListenPrefix, $wildErr) 'Yellow'
+
+    # Retry loopback-only before giving up. The wildcard prefix needs a URL
+    # ACL; http://127.0.0.1:<port>/ does not. Someone who only ever uses the
+    # chat on this PC needs no wildcard at all, so a hard exit here turned a
+    # working desktop install into a dead one for no reason.
+    $loopback = 'http://127.0.0.1:{0}/' -f $ListenPort
+    try {
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add($loopback)
+        $listener.Start()
+        $BoundPrefix = $loopback
+        Say ("[ok] listening on {0} -- THIS PC ONLY." -f $loopback) 'Yellow'
+        Say  "     Phones and other devices on your network will NOT reach it." 'Yellow'
+        Say  "     Run setup-lan.bat as Administrator to enable LAN access." 'Yellow'
+    } catch {
+        Say ("[fatal] could not bind {0} either -- {1}" -f $loopback, $_.Exception.Message) 'Red'
+        Say  "        Checklist, in order of likelihood:" 'Red'
+        Say ("          1. netsh interface ipv4 show excludedportrange protocol=tcp") 'Red'
+        Say ("             Is {0} inside a reserved range? Hyper-V, WSL2 and Docker" -f $ListenPort) 'Red'
+        Say  "             reserve blocks in this range. netstat cannot see these." 'Red'
+        Say ("          2. netsh http show urlacl url={0}" -f $ListenPrefix) 'Red'
+        Say  "             Missing URL ACL -- this is the one setup-lan.bat fixes." 'Red'
+        Say  "          3. netsh http show servicestate" 'Red'
+        Say  "             Another service (IIS, VMware, Citrix) may own the prefix." 'Red'
+        Say  "" 'Red'
+        Say ("        To use a different port, set GEMMA_LISTEN_PORT before launching.") 'Red'
+        exit 1
+    }
+}
+
+Say ("[ok] listening on {0}" -f $BoundPrefix)
+Say ("[ok] access password required (salted-hash verified; set via launch.bat)")
+Say ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
 if ($LlmApiKey -eq '') {
     Write-Host "[warn] GEMMA_LLM_API_KEY not set -- llama-server running without --api-key (loopback bind still protects it)."
 } else {
@@ -1717,6 +1906,12 @@ while ($listener.IsListening) {
     $request  = $ctx.Request
     $response = $ctx.Response
     try {
+        # Sweep finished workers on every request, not just job traffic.
+        # Reaping used to happen only inside Handle-Jobs, so a user who
+        # pressed Stop and then closed the tab sent no further job requests
+        # and left the runspace alive indefinitely.
+        Remove-CompletedJobWorkers
+
         Add-CommonHeaders $response
 
         if ($request.HttpMethod -eq 'OPTIONS') {
@@ -1807,6 +2002,9 @@ while ($listener.IsListening) {
         elseif ($path -eq '/state' -or $path -like '/state/*') {
             Handle-State -Request $request -Response $response
         }
+        elseif ($path -eq '/perf') {
+            Handle-Perf -Request $request -Response $response
+        }
         elseif ($path -eq '/swap-model') {
             Handle-SwapModel -Request $request -Response $response
         }
@@ -1819,99 +2017,53 @@ while ($listener.IsListening) {
             # LLAMA_URL-relative addressing (and the session cookie) working.
             Handle-Jobs -Request $request -Response $response
         }
-        elseif ($path -eq '/models-list.json' -or $path -eq '/active-model.json') {
-            # SYNTHESISE THE MODEL LIST when there is no GGUF directory.
-            #
-            # Upstream's launch.bat writes these two files by scanning a folder
-            # of .gguf files. Against any served backend there is no such folder,
-            # so both 404 and the picker renders one dead "Custom GGUF" entry --
-            # the app looks connected and modelless at the same time. The backend
-            # already knows its own models; /v1/models is the endpoint every
-            # OpenAI-compatible server exposes, so ask it.
-            #
-            # A REAL file still wins: a llama.cpp install with a models folder
-            # keeps its own list, and this only fills a gap rather than
-            # overriding anything.
-            # A REAL file wins, served through the SAME path-resolution the
-            # static branch uses -- Resolve-StaticPath is what enforces the
-            # traversal and dot-file rules, so bypassing it here would open a
-            # hole for the sake of two filenames.
-            $onDisk = Resolve-StaticPath -UrlPath $path
-            if ($null -ne $onDisk) {
-                $bytes = [System.IO.File]::ReadAllBytes($onDisk)
-                $response.StatusCode = 200
-                $response.ContentType = 'application/json'
-                $response.ContentLength64 = $bytes.Length
-                $response.OutputStream.Write($bytes, 0, $bytes.Length)
-            } else {
-                $ids = @()
-                try {
-                    $h = @{}
-                    if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
-                    $u = ('http://127.0.0.1:{0}/v1/models' -f $LlmPort)
-                    $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
-                    $ids = ((($r.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id })
-                } catch { }
-                # Offer only what can answer. A dropdown listing models that
-                # cannot reply is the same defect as one that refuses every
-                # choice -- it just fails later and more confusingly. If NOTHING
-                # is live the full list is kept, because an empty picker hides
-                # the problem instead of showing it.
-                $live = @($ids | Where-Object { Test-ModelServes $_ })
-                if ($live.Count -gt 0) { $ids = $live }
-                $active = if ($LlmModel -ne '') { $LlmModel } elseif ($ids.Count -gt 0) { $ids[0] } else { '' }
-                if ($path -eq '/active-model.json') {
-                    $payload = @{
-                        ggufFile = $active; id = $active; name = $active
-                        family = 'served'; maxCtx = 131072; defaultCtx = 24576
-                    }
-                } else {
-                    $payload = @{ models = @( $ids | ForEach-Object {
-                        @{ file = $_; name = $_; id = $_; family = 'served'
-                           thinkingFormat = 'none'; active = ($_ -eq $active) } } ) }
-                }
-                Write-Json $response 200 $payload
-            }
-        }
-
         elseif ($path -eq '/llm/health') {
-            # BACKEND-AGNOSTIC HEALTH.
+            # The client asks /llm/health and expects llama-server's
+            # {"status":"ok"}. Proxied straight through, that 404s against any
+            # OTHER OpenAI-compatible server -- Ollama, vLLM, LM Studio, a
+            # gateway -- none of which serve /health. The UI then reports
+            # "OFFLINE -- run launch.bat" while a perfectly good backend is
+            # sitting there answering /v1/chat/completions, which is the only
+            # endpoint this app actually generates with.
             #
-            # The client asks /llm/health and expects llama.cpp's {"status":"ok"}.
-            # Proxied straight through, that 404s against ANY other
-            # OpenAI-compatible server -- Ollama, vLLM, a gateway -- none of
-            # which serve /health. The UI then shows "Error: HTTP 404" and
-            # "OFFLINE -- run launch.bat" while a perfectly good backend sits
-            # there answering /v1/chat/completions, which is the ONLY endpoint
-            # this app actually generates with (see line ~821).
-            #
-            # So: ask /health, and if that is not there ask /v1/models, which is
-            # the one endpoint every OpenAI-compatible server does serve. Either
-            # answer means the same thing to the caller -- something is up and
-            # can generate -- so it is reported in the shape the client already
+            # So: ask /health, and if it is not there ask /v1/models -- the one
+            # endpoint every OpenAI-compatible server does serve. Either answer
+            # means the same thing to the caller (something is up and can
+            # generate), so it is reported in the shape the client already
             # understands rather than making the client learn a second one.
+            #
+            # llama-server is unaffected: /health answers on the first probe and
+            # the second is never sent.
             $ok = $false
             foreach ($probe in @('/health', '/v1/models')) {
                 try {
                     $u = ('http://127.0.0.1:{0}{1}' -f $LlmPort, $probe)
-                    $h = @{}; if ($LlmApiKey -ne '') { $h['Authorization'] = ('Bearer {0}' -f $LlmApiKey) }
-                    $r = Invoke-WebRequest -Uri $u -Headers $h -TimeoutSec 4 -UseBasicParsing -ErrorAction Stop
-                    if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300) { $ok = $true; break }
-                } catch { }
+                    $hr = [System.Net.HttpWebRequest]::Create($u)
+                    $hr.Method = 'GET'
+                    $hr.Timeout = 4000
+                    $hr.ReadWriteTimeout = 4000
+                    if ($LlmApiKey -ne '') {
+                        $hr.Headers.Add('Authorization', ('Bearer {0}' -f $LlmApiKey))
+                    }
+                    $hresp = $hr.GetResponse()
+                    $code  = [int]$hresp.StatusCode
+                    $hresp.Close()
+                    if ($code -ge 200 -and $code -lt 300) { $ok = $true; break }
+                } catch {
+                    # Try the next probe; a 404 here is the normal case for a
+                    # server that simply does not implement /health.
+                }
             }
-            $body = if ($ok) { '{"status":"ok"}' } else { '{"status":"unavailable"}' }
-            $bytes = [Text.Encoding]::UTF8.GetBytes($body)
-            $response.StatusCode  = if ($ok) { 200 } else { 503 }
-            $response.ContentType = 'application/json'
-            $response.ContentLength64 = $bytes.Length
-            $response.OutputStream.Write($bytes, 0, $bytes.Length)
-            $response.OutputStream.Close()
+            if ($ok) { Write-Json $Response 200 @{ status = 'ok' } }
+            else     { Write-Json $Response 503 @{ status = 'unavailable' } }
         }
+
         elseif ($path -eq '/llm' -or $path -like '/llm/*') {
             Invoke-Proxy -Request $request -Response $response -Prefix '/llm' -UpstreamPort $LlmPort -InjectLlmKey $true
         }
         elseif ($path -eq '/search' -or $path -like '/search/*') {
-            Invoke-Proxy -Request $request -Response $response -Prefix '/search' -UpstreamPort $SearchPort
+            # Direct, no second process. See Handle-Search.
+            Handle-Search -Request $request -Response $response -SubPath ($path.Substring(7))
         }
         elseif ($path -eq '/embed' -or $path -like '/embed/*') {
             # RAG embedding upstream (llama-server --embeddings on loopback).
