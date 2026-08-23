@@ -66,6 +66,51 @@
   // exited 2 (NOT VERIFIED) on every run. Fixed in the same commit as this line.
   var FIRST_TOKEN_FAIL_MS = 60000;
   var WORKER_URL = '/workers/webgpu-brain-bonsai-worker.js';
+
+  // WHERE THE WORKERS ACTUALLY ARE. That path is origin-ABSOLUTE, which is right
+  // for gobbonet.aitherium.com (app and workers both at the root) and for
+  // aitherium.com (app under /gobbonet/, workers at the ROOT) — and wrong for
+  // every SUBPATH copy of this demo, where it 404s and the engine never starts.
+  //
+  // Measured 2026-08-23, driving both live: on wizzense.github.io/GobboNet/ the
+  // page rendered, chat answered, and the answer was "[the in-browser model
+  // worker crashed before it could start]", while the root origin got far enough
+  // to report "no WebGPU adapter" — an honest hardware answer. Same code, and
+  // only the second one had actually reached the engine. Any vendored copy of
+  // this page on another Pages site fails the first way, silently.
+  //
+  // Resolve by PROBE, not by rule, because the origins genuinely disagree: on the
+  // apex the workers are NOT beside the adapter, so "always relative" breaks it.
+  // Adapter-relative first (right for every subpath copy), origin-absolute second
+  // (right for the apex). Cached: one HEAD per worker per session.
+  var ADAPTER_DIR = (function () {
+    try {
+      var src = document.currentScript && document.currentScript.src;
+      if (src) return new URL('.', src).href;
+    } catch (e) { /* no currentScript here; fall through */ }
+    try { return new URL('.', window.location.href).href; } catch (e) { return ''; }
+  })();
+
+  var _workerUrlCache = {};
+  function resolveWorkerUrl(absolutePath) {
+    if (_workerUrlCache[absolutePath]) return _workerUrlCache[absolutePath];
+    var name = absolutePath.split('/').pop();
+    var cands = [];
+    try { if (ADAPTER_DIR) cands.push(new URL('workers/' + name, ADAPTER_DIR).href); }
+    catch (e) { /* an unparseable base is simply not a candidate */ }
+    try { cands.push(new URL(absolutePath, window.location.origin).href); }
+    catch (e) { cands.push(absolutePath); }
+    var last = cands[cands.length - 1];
+    _workerUrlCache[absolutePath] = (function next(i) {
+      if (i >= cands.length) return Promise.resolve(last);
+      // HEAD, never GET: on our own origins the real bundle is ~235KB, and a GET
+      // probe would pull the engine down twice every session.
+      return fetch(cands[i], { method: 'HEAD' })
+        .then(function (r) { return (r && r.ok) ? cands[i] : next(i + 1); })
+        .catch(function () { return next(i + 1); });
+    })(0);
+    return _workerUrlCache[absolutePath];
+  }
   // THE CPU LANE. llama.cpp compiled to wasm (wllama), same message protocol as the GPU
   // worker, takes a weights URL as its modelId. Served beside the GPU worker on every
   // Pages origin (verified 2026-08-23 on aitherium.com, gobbonet.aitherium.com and
@@ -896,8 +941,9 @@
     if (active && active.timer) { clearTimeout(active.timer); active.timer = null; }
   }
 
-  function spawn() {
-    var w = new Worker(cpuLane() ? WASM_WORKER_URL : WORKER_URL, { type: 'module' });
+  function spawn(resolvedUrl) {
+    var w = new Worker(resolvedUrl || (cpuLane() ? WASM_WORKER_URL : WORKER_URL),
+                       { type: 'module' });
 
     w.onmessage = function (ev) {
       var msg = ev.data || {};
@@ -999,8 +1045,13 @@
     // chokepoint discipline start() uses in webgpu-brain.tsx — a third caller added later
     // inherits the gate instead of having to remember it.
     return requireConsent().then(function () {
+      // Resolve the lane's worker BEFORE constructing it: a 404 here is what a
+      // subpath deployment used to hit, and `new Worker` on a 404 dies as an
+      // opaque "crashed before it could start".
+      return resolveWorkerUrl(cpuLane() ? WASM_WORKER_URL : WORKER_URL);
+    }).then(function (resolvedUrl) {
       if (!worker) {
-        worker = spawn();
+        worker = spawn(resolvedUrl);
         // The wasm worker has no catalogue: its modelId IS the weights URL.
         worker.postMessage({ type: 'load', modelId: cpuLane() ? wasmModelUrl(modelId) : modelId });
       }
