@@ -83,12 +83,24 @@ jobs:
         shell: pwsh
         run: |
           $env:GEMMA_LISTEN_PORT = "8099"
-          # A CI runner cannot answer an interactive prompt, and the guide says
-          # the launcher asks for a password on first start. A server waiting on
-          # one is indistinguishable from a server that failed to bind, so try
-          # the non-interactive shape; the captured log below says whether it
-          # was honoured.
-          $env:GEMMA_PASSWORD = "ci-smoke-not-a-real-secret"
+          # fileserver.ps1 exits BEFORE it binds if it has no access secret, so
+          # a missing one looks exactly like a port or firewall problem. Its own
+          # [FATAL] says so in as many words -- that message is what turned this
+          # lane from "never served" into a one-line fix.
+          #
+          # Format, read from the source rather than guessed:
+          #   ^([0-9a-fA-F]+):([0-9a-fA-F]+)$   salt:hash, both hex
+          #   hash = SHA256(salt AS TEXT + password)  -- the salt is NOT decoded
+          # The salt must therefore LOOK hex to pass the regex and is then
+          # concatenated as a string. Computed here rather than pasted as a
+          # constant, so a change to the hashing shows up as a mismatch instead
+          # of a stale magic value nobody can check.
+          $salt = "c1c1c1c1"
+          $pw   = "ci-smoke-not-a-real-password"
+          $sha  = [System.Security.Cryptography.SHA256]::Create()
+          $hash = ([BitConverter]::ToString($sha.ComputeHash(
+                     [System.Text.Encoding]::UTF8.GetBytes($salt + $pw))) -replace '-').ToLower()
+          $env:GEMMA_ACCESS_SECRET = "${salt}:${hash}"
           # CAPTURE BOTH STREAMS. The first version redirected nothing, so a
           # failure printed "never served" and no cause -- a red lane that names
           # nothing is barely a lane.
