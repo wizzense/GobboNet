@@ -16,6 +16,22 @@ async function sendMessage(overrideContent) {
   const hasAttachments = !isProgrammatic && _pendingAttachments.length > 0;
   if ((!content && !hasAttachments) || isGenerating) return;
 
+  // /imagine -- local image generation. Intercepted here rather than being
+  // sent to the model, and deliberately BEFORE the thread/job machinery: an
+  // image is not an LLM turn, has no streaming job to reattach, and must not
+  // take the pendingJob path. See js/25-image.js for the backend routing.
+  if (!isProgrammatic && /^\/(imagine|img)\s/i.test(content)) {
+    if (typeof handleImagineCommand === 'function') {
+      input.value = '';
+      await handleImagineCommand(content.replace(/^\/(imagine|img)\s+/i, ''));
+      return;
+    }
+    // The module did not load. Say so rather than sending "/imagine a cat"
+    // to the LLM, which would answer as if it had been asked to describe one.
+    showModelSwitchToast('Image generation is not loaded on this page.', 'error', 4000);
+    return;
+  }
+
   // Manual send while a chain is mid-countdown → user is taking back
   // control. Drop the chain before proceeding with their message.
   if (!isProgrammatic && autoContinue) {

@@ -51,6 +51,17 @@ $SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
+# Image generation. Optional infra, same contract as $EmbedPort: if nothing is
+# listening, /image returns 502 and the UI says so rather than pretending.
+#
+# 8188 is ComfyUI's default. The other two candidates below are only probed,
+# never started -- GobboNet does not install anything for you, and a backend
+# you did not choose to run is not one we are going to launch behind your back.
+#
+# EVERY candidate is a LOOPBACK port. That is the whole design: image bytes
+# never leave the machine, exactly like the llama-server lane. If you find
+# yourself adding a hostname here, you are breaking the promise in the README.
+$ImagePort    = [int](Get-EnvOrDefault 'GEMMA_IMAGE_PORT'    '8188')
 # Listen port. Default 9066 ("gobb" on a keypad).
 #
 # It was 8080, which was a bad neighbour: 8080 is the most contended port
@@ -540,6 +551,85 @@ function Resolve-StaticPath {
     return $full
 }
 
+# --- Image backend discovery -------------------------------------------------
+# Which local image generators are actually answering right now.
+#
+# ORDER IS PREFERENCE, and it is deliberate: ComfyUI first because it is the
+# one most people already have; then the awdk lane, which an agent stack may
+# be serving; then Bonsai, which needs no server at all because it runs in the
+# browser and is therefore always "available" but slowest and lowest quality.
+#
+# We never START any of these. GobboNet installs nothing and launches nothing
+# on your behalf -- see the README's promise about what this program does to
+# your machine. Detection only.
+# PROBE THE ROUTE WE WOULD ACTUALLY CALL, NOT /health.
+#
+# Measured on a real box while writing this: the awdk daemon on :9001
+# answers /health with 200 and answers /v1/images/generations with 404.
+# A liveness probe therefore reports the lane UP, routing lands on it,
+# and the user gets a 404 instead of a picture. /health is a MENU, not a
+# capability -- it tells you a process is alive, never that it can do the
+# one thing you are about to ask for.
+#
+# So each candidate names the endpoint generation really uses, and a 404
+# on that endpoint means NOT CAPABLE even though the server is plainly
+# running. Any other HTTP answer (200, 401, 405, 422...) means the route
+# exists and the lane is worth trying.
+$ImageBackendCandidates = @(
+    @{ id = 'comfyui'; label = 'ComfyUI';        port = $ImagePort
+       probe = '/object_info/CheckpointLoaderSimple' }
+    @{ id = 'sana';    label = 'Sana (awdk)';    port = 8202
+       probe = '/v1/images/generations' }
+    @{ id = 'awdk';    label = 'awdk image API'; port = 9001
+       probe = '/v1/images/generations' }
+)
+
+function Test-LocalPort {
+    param([int]$Port, [string]$ProbePath, [int]$TimeoutMs = 900)
+    # Returns the HTTP status code, 0 if nothing answered at all. The
+    # CALLER decides what a given code means -- see Probe-ImageBackends,
+    # where 404 is "route absent" rather than "server absent".
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port$ProbePath")
+        $req.Timeout = $TimeoutMs
+        $req.ReadWriteTimeout = $TimeoutMs
+        $req.Method = 'GET'
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+        return $code
+    } catch [System.Net.WebException] {
+        if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode }
+        return 0
+    } catch {
+        return 0
+    }
+}
+
+function Probe-ImageBackends {
+    $out = @()
+    foreach ($c in $ImageBackendCandidates) {
+        if ($c.id -eq 'bonsai') { continue }
+        $code = Test-LocalPort -Port $c.port -ProbePath $c.probe
+        # 0   = nothing listening.
+        # 404 = a server, but not one that can generate. Reported with the
+        #       code so the UI can say "running, no image route" instead of
+        #       the flatly wrong "not running".
+        $up = ($code -ne 0 -and $code -ne 404)
+        $why = if ($code -eq 0) { 'not running' }
+               elseif ($code -eq 404) { 'running, but no image route (HTTP 404)' }
+               else { "ready (HTTP $code)" }
+        $out += @{ id = $c.id; label = $c.label; port = $c.port; up = $up
+                   status = $code; note = $why }
+    }
+    # Bonsai runs IN THE BROWSER, so the host cannot answer for it and must not
+    # pretend to. It is reported as a client-decided lane; js/25-image.js is
+    # what decides whether WebGPU is actually present.
+    $out += @{ id = 'bonsai'; label = 'Bonsai (in-browser)'; port = 0; up = $null;
+               note = 'client-side; the browser decides' }
+    return $out
+}
+
 # --- Reverse proxy -----------------------------------------------------------
 
 # Pass a request through to an upstream HTTP server, streaming the response
@@ -582,6 +672,20 @@ function Invoke-Proxy {
             $val = $Request.Headers[$key]
             switch -Regex ($key) {
                 '^(Host|Content-Length|Connection|Keep-Alive|Transfer-Encoding|Expect|Proxy-Connection)$' { continue }
+                # Origin and Referer describe the GOBBONET PAGE, not this
+                # upstream call, and forwarding them breaks CSRF-protected
+                # backends. Measured against ComfyUI 0.3.71: POST /prompt with
+                # no Origin returns 400 (a graph error -- it processed the
+                # request), and the SAME post carrying Origin http://127.0.0.1:9066
+                # returns 403 before looking at the body. The user sees "refused
+                # the job (HTTP 403)" and nothing anywhere names the header.
+                #
+                # A reverse proxy on loopback is not a cross-origin caller; the
+                # browser's Origin is an artifact of how the page reached us.
+                # Dropping it is what every reverse proxy does here, and it
+                # cannot weaken anything: these upstreams are loopback-bound and
+                # already gated by this server's own session cookie.
+                '^(Origin|Referer)$' { continue }
                 '^Content-Type$' { $req.ContentType = $val; continue }
                 '^User-Agent$'   { $req.UserAgent   = $val; continue }
                 '^Accept$'       { $req.Accept      = $val; continue }
@@ -2064,6 +2168,28 @@ while ($listener.IsListening) {
         elseif ($path -eq '/search' -or $path -like '/search/*') {
             # Direct, no second process. See Handle-Search.
             Handle-Search -Request $request -Response $response -SubPath ($path.Substring(7))
+        }
+        elseif ($path -eq '/image/backends') {
+            # WHY THIS IS SERVER-SIDE, and it is not a nicety.
+            #
+            # When you open GobboNet from your phone over the LAN, the browser
+            # is NOT on this machine. `fetch('http://127.0.0.1:8188')` from
+            # that phone probes the PHONE's loopback, finds nothing, and the
+            # UI would report "no image backend" while ComfyUI is running
+            # perfectly well right here. The host is the only party that can
+            # answer this question, so the host answers it.
+            #
+            # Probes are cheap (a short-timeout GET) and report per candidate.
+            # A candidate that times out is reported as down WITH its port, so
+            # "nothing found" always names what was tried -- an empty list with
+            # no explanation is indistinguishable from a broken probe.
+            Write-Json $response 200 @{ backends = (Probe-ImageBackends) }
+        }
+        elseif ($path -eq '/image' -or $path -like '/image/*') {
+            # Same shape as /llm and /embed: a loopback reverse proxy so the
+            # phone authenticates once with its session cookie and never needs
+            # to reach the backend directly. 502 when nothing is listening.
+            Invoke-Proxy -Request $request -Response $response -Prefix '/image' -UpstreamPort $ImagePort
         }
         elseif ($path -eq '/embed' -or $path -like '/embed/*') {
             # RAG embedding upstream (llama-server --embeddings on loopback).

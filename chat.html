@@ -954,6 +954,9 @@ gobbo.every(5, async () =&gt; {
 <script src="js/21-data.js"></script>
 <script src="js/22-scheduler.js"></script>
 <script src="js/23-card-code.js"></script>
+<!-- Image generation. Loads BEFORE boot so detectImageBackends() exists
+     when boot runs it; it defines functions only and touches no DOM. -->
+<script src="js/25-image.js"></script>
 <script src="js/24-boot.js"></script>
 </body>
 </html>

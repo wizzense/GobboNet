@@ -380,15 +380,40 @@ function renderMessages() {
       }).join('') + '</div>';
     }
 
+    // Generated images (/imagine). Deliberately NOT the attachment chip path
+    // above -- that renders a thumbnail, which is right for "here is a file I
+    // attached" and wrong for "here is the picture you asked for".
+    //
+    // Still routed through safeDataUrl, which returns '' for anything that is
+    // not already-local bytes. js/25-image.js inlines every result as a data:
+    // URL for exactly this reason; if one ever arrives as http(s) it renders
+    // as nothing rather than beaconing, and the empty-src guard below says so
+    // instead of showing a broken image box.
+    let generatedHtml = '';
+    if (Array.isArray(m.generatedImages) && m.generatedImages.length) {
+      generatedHtml = '<div class="msg-generated">' + m.generatedImages.map(g => {
+        const src = safeDataUrl(g.dataUrl || '');
+        if (!src) {
+          return '<div class="msg-generated-blocked">[image suppressed: not local bytes]</div>';
+        }
+        const cap = escapeHtml(g.prompt || '');
+        const meta = escapeHtml([g.backend, g.ckpt].filter(Boolean).join(' / '));
+        return `<figure class="msg-generated-fig">` +
+               `<img class="msg-generated-img" src="${escapeHtml(src)}" alt="${cap}" loading="lazy">` +
+               `<figcaption class="msg-generated-cap">${cap}${meta ? ` <span class="msg-generated-meta">// ${meta}</span>` : ''}</figcaption>` +
+               `</figure>`;
+      }).join('') + '</div>';
+    }
+
     // Build main content
     let mainContent = '';
     if (showTypingDots) {
       mainContent = '<div class="message-content"><span class="typing-indicator"><span></span><span></span><span></span></span></div>';
     } else if (m.content || !m.reasoning) {
-      mainContent = `<div class="message-content"${textColorStyle}>${parsed}</div>${attachmentsHtml}${searchBlock}`;
+      mainContent = `<div class="message-content"${textColorStyle}>${parsed}</div>${generatedHtml}${attachmentsHtml}${searchBlock}`;
     } else {
       // Has reasoning but no content yet — show a small waiting indicator
-      mainContent = `<div class="message-content" style="opacity:0.5;font-style:italic;">Composing response...</div>${attachmentsHtml}`;
+      mainContent = `<div class="message-content" style="opacity:0.5;font-style:italic;">Composing response...</div>${generatedHtml}${attachmentsHtml}`;
     }
 
     return `

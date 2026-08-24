@@ -148,3 +148,42 @@ a.search-entry-title:hover {
   margin-top: 8px;
   justify-content: flex-end;
 }
+
+/* ── Generated images (/imagine) ────────────────────────────────
+   Deliberately NOT the .msg-attach-thumb chip: an attachment is a
+   file you added, a generated image is the answer itself and gets
+   the width to be looked at. Capped so a 1024px render does not
+   push the composer off a phone screen. */
+.msg-generated {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+.msg-generated-fig {
+  margin: 0;
+  border: 1px solid var(--green-dim);
+  background: var(--bg-panel, #0a0f0a);
+  padding: 6px;
+  max-width: 640px;
+}
+.msg-generated-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: auto;
+}
+.msg-generated-cap {
+  font-size: 11px;
+  color: var(--green-dim);
+  padding: 6px 2px 2px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.msg-generated-meta { opacity: 0.7; }
+.msg-generated-blocked {
+  font-size: 11px;
+  color: var(--amber, #b58900);
+  border: 1px dashed currentColor;
+  padding: 8px;
+}
