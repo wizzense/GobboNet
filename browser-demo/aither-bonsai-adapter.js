@@ -338,7 +338,7 @@
   // per-visitor download consent still gates every load.
   var ALLOWED_HOSTS = ['aitherium.com', 'www.aitherium.com', 'desktop.aitherium.com',
     'spaces.aitherium.com', 'gobbonet.aitherium.com', 'dgg.aitherium.com',
-    'garg.aitherium.com', 'localhost', '127.0.0.1',
+    'garg.aitherium.com', 'vibe.aitherium.com', 'localhost', '127.0.0.1',
     'elodineofficial.github.io', 'wizzense.github.io'];
   var DENIED_PATHS = ['/blog', '/docs', '/media', '/changelog', '/pricing', '/about',
     '/privacy', '/terms', '/legal', '/help', '/support', '/welcome', '/status'];
