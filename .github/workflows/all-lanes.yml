@@ -178,11 +178,28 @@ jobs:
         # reports it is not running. This SKIPS loudly rather than pretending.
         run: |
           set -uo pipefail
-          IMG=ghcr.io/aitherium/gobbonet-appliance:latest
-          if ! docker manifest inspect "$IMG" >/dev/null 2>&1; then
+          # The fork's OWN namespace. The first version pointed at the
+          # aitherium org, whose package is INTERNAL -- a public repo's CI
+          # pulls anonymously, so this lane could never see it and always
+          # took the skip branch, reporting SUCCESS having run nothing.
+          IMG=ghcr.io/wizzense/gobbonet-appliance:latest
+          # "cannot pull" has two causes that need OPPOSITE fixes: the image
+          # does not exist, or it exists and is private. Printing one message
+          # for both is what let the previous version look fine while pointing
+          # at an image nobody outside the org could ever fetch.
+          if ! docker manifest inspect "$IMG" 2> manifest.err; then
+            if grep -qiE "denied|unauthorized|forbidden" manifest.err; then
+              echo "::error::$IMG exists but is NOT PUBLIC — anonymous CI cannot pull it."
+              echo "Fix: make the ghcr package public (Packages → gobbonet-appliance →"
+              echo "     Package settings → Change visibility)."
+              cat manifest.err
+              exit 1
+            fi
             echo "::notice::$IMG is not published yet — this lane is NOT running."
-            echo "Build it locally: podman build -t gobbonet-appliance:latest \\"
-            echo "  -f Containerfile.gobbonet-appliance .   (in the awnix bootc tree)"
+            echo "Build and push it from the awnix bootc tree:"
+            echo "  podman build -t ghcr.io/wizzense/gobbonet-appliance:latest \\"
+            echo "    -f Containerfile.gobbonet-appliance ."
+            echo "  podman push ghcr.io/wizzense/gobbonet-appliance:latest"
             exit 0
           fi
           docker run -d --name gob -p 8097:8080 "$IMG" \
