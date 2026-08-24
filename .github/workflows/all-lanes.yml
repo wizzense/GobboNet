@@ -1,0 +1,164 @@
+name: all lanes
+
+# Every way to run GobboNet, proven on every push. Free: GitHub-hosted runners
+# cost nothing on public repositories, macOS included.
+#
+# The point is that a user can PICK. Stock Windows is the product as shipped;
+# awdk is the same UI with no PowerShell (which is what makes macOS and Linux
+# work); awnix is the sandboxed appliance for running an agent you do not
+# entirely trust yet.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── the failure their own docs describe ────────────────────────────────────
+  structure:
+    name: the asset tree is intact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: css/ and js/ are present and populated
+        # TROUBLESHOOTING.md: "The chat screen is blank, unstyled, or looks
+        # broken. The css and js folders aren't where the app expects them."
+        # That is a real, recurring user report, and it is a directory listing
+        # away from being impossible to ship.
+        run: |
+          set -euo pipefail
+          test -d css || { echo "::error::css/ is missing — the chat screen renders unstyled"; exit 1; }
+          test -d js  || { echo "::error::js/ is missing — the chat screen renders blank"; exit 1; }
+          ncss=$(find css -type f | wc -l); njs=$(find js -type f | wc -l)
+          echo "css/: $ncss files, js/: $njs files"
+          [ "$ncss" -gt 0 ] && [ "$njs" -gt 0 ] || { echo "::error::an asset dir is empty"; exit 1; }
+      - name: chat.html references assets that exist
+        # A <script src> or <link href> pointing at a file nobody shipped is the
+        # same blank page, arriving by a different route.
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          html = pathlib.Path("chat.html").read_text(encoding="utf-8", errors="replace")
+          refs = re.findall(r'(?:src|href)="((?:css|js)/[^"]+)"', html)
+          missing = [r for r in refs if not pathlib.Path(r).is_file()]
+          print(f"{len(refs)} local asset reference(s); {len(missing)} missing")
+          for m in missing:
+              print(f"::error::chat.html references {m}, which is not in the repo")
+          sys.exit(1 if missing else 0)
+          PY
+
+  # ── PowerShell is cross-platform even though the app is Windows-first ──────
+  pwsh-parse:
+    name: PowerShell parses on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every .ps1 parses
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $errs = $null; $toks = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$toks, [ref]$errs) | Out-Null
+            if ($errs) {
+              $bad++
+              Write-Host "::error file=$($_.Name)::$($errs.Count) parse error(s): $($errs[0].Message)"
+            } else { Write-Host "  ok $($_.Name)" }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+  # ── the product as shipped ────────────────────────────────────────────────
+  stock-windows:
+    name: stock — fileserver.ps1 serves the UI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Serve and fetch chat.html
+        shell: pwsh
+        run: |
+          $env:GEMMA_LISTEN_PORT = "8099"
+          $p = Start-Process pwsh -PassThru -WindowStyle Hidden `
+                 -ArgumentList '-NoProfile','-File','fileserver.ps1'
+          try {
+            $ok = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 2
+              try {
+                # 401 still proves it is SERVING -- the app can require a
+                # password, and "refused" is the failure we care about.
+                $r = Invoke-WebRequest "http://127.0.0.1:8099/chat.html" `
+                       -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                if ($r.StatusCode -in 200,401) { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) { Write-Host "::error::fileserver.ps1 never served chat.html"; exit 1 }
+            Write-Host "  fileserver.ps1 is serving"
+          } finally { if ($p -and -not $p.HasExited) { $p.Kill() } }
+
+  # ── the same UI, no PowerShell: this is what makes macOS and Linux work ────
+  awdk:
+    name: awdk — adk gobbonet on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install awdk
+        run: pip install "awdk[memory]"
+      - name: The launcher serves THIS checkout
+        # --ui . so it serves the tree under test, not one it clones. Otherwise
+        # the job proves awdk works and says nothing about this repo.
+        shell: bash
+        run: |
+          set -euo pipefail
+          adk gobbonet --ui . --port 8098 --no-open > /tmp/adk.log 2>&1 &
+          ok=0
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8098/chat.html || echo 000)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+          if [ "$ok" != "1" ]; then echo "::error::adk gobbonet never served chat.html"; cat /tmp/adk.log; exit 1; fi
+          curl -sf -o /dev/null http://127.0.0.1:8098/js/24-boot.js \
+            || { echo "::error::chat.html served but its scripts did not — a blank page"; exit 1; }
+          echo "  adk gobbonet serves chat.html and its assets"
+
+  # ── the sandboxed appliance ───────────────────────────────────────────────
+  awnix:
+    name: awnix — sandboxed appliance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull the appliance, or say plainly that it is not published
+        # A lane that silently passes when it did nothing is worse than one that
+        # reports it is not running. This SKIPS loudly rather than pretending.
+        run: |
+          set -uo pipefail
+          IMG=ghcr.io/aitherium/gobbonet-appliance:latest
+          if ! docker manifest inspect "$IMG" >/dev/null 2>&1; then
+            echo "::notice::$IMG is not published yet — this lane is NOT running."
+            echo "Build it locally: podman build -t gobbonet-appliance:latest \\"
+            echo "  -f Containerfile.gobbonet-appliance .   (in the awnix bootc tree)"
+            exit 0
+          fi
+          docker run -d --name gob -p 8097:8080 "$IMG" \
+            adk gobbonet --ui /opt/gobbonet --port 8080 --host 0.0.0.0 --no-open
+          ok=0
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8097/chat.html || echo 000)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs gob 2>&1 | tail -20
+          [ "$ok" = "1" ] || { echo "::error::the appliance never served chat.html"; exit 1; }
+          echo "  the appliance serves the UI"
