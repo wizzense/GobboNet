@@ -894,6 +894,28 @@
 
     w.onmessage = function (ev) {
       var msg = ev.data || {};
+
+      // IMAGES ARE READ STRUCTURALLY, BEFORE THE SWITCH — the same move the
+      // desktop surface makes (webgpu-brain.tsx). The worker has its OWN
+      // protocol, so a message type can be on the wire before anything here
+      // knows it exists; reading the shape is a read, not a fork. Doing it in
+      // the switch would also mean a `default` that swallows it silently.
+      //
+      // Dispatching a plain CustomEvent rather than rendering here is the
+      // point: the wire protocol and the rendering can then change without
+      // touching each other, and ANY mod — including a community ComfyUI one
+      // — can raise the same event and get the same gallery for free.
+      if (msg.type === 'image' && Array.isArray(msg.images)) {
+        var srcs = msg.images.map(function (i) {
+          return i && (i.dataUrl || i.url || i.src);
+        }).filter(Boolean);
+        if (srcs.length) {
+          window.dispatchEvent(new CustomEvent('gobbonet:image',
+            { detail: { images: srcs } }));
+        }
+        return;
+      }
+
       switch (msg.type) {
         case 'ready':
           ready = true;
@@ -905,11 +927,14 @@
           readyWaiters.splice(0).forEach(function (x) { x.resolve(); });
           break;
         case 'tool_action':
-        case 'image':
-          // Named explicitly so they are DECLINED, not silently swallowed by falling
-          // off the switch. Both are honoured on the desktop surface and cannot be
-          // here; the tools that raise them are filtered out of the request for exactly
-          // that reason, so reaching this arm means the filter has a hole.
+          // Named explicitly so it is DECLINED, not silently swallowed by falling
+          // off the switch. It is honoured on the desktop surface and cannot be
+          // here (there is no window to open); the tools that raise it are filtered
+          // out of the request for exactly that reason, so reaching this arm means
+          // the filter has a hole.
+          //
+          // `image` USED to be declined alongside it. It no longer is — it is
+          // dispatched above as `gobbonet:image`, which the image mod renders.
           break;
         case 'progress':
           // The worker reports a FINISHED TOOL CALL as a progress line carrying `file`
