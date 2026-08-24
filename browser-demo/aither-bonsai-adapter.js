@@ -145,8 +145,17 @@
   var UNSUPPORTED_TOOLS = {
     open_app: 'this page is a chat, not the desktop -- there is no window to open',
     list_apps: 'no app surface here, so the list is always empty',
-    search_knowledge: 'needs an anon platform identity this page never mints',
-    generate_image: 'the worker returns images on a channel this page does not render'
+    search_knowledge: 'needs an anon platform identity this page never mints'
+    // generate_image was HERE until 2026-08-24, with the reason 'the worker returns
+    // images on a channel this page does not render'. That is no longer true: the
+    // image mod renders them, this file dispatches `gobbonet:image` to it, and both
+    // halves are verified live on every origin. Filtering it out now is what makes
+    // `/imagine a cat` answer with a PARAGRAPH ABOUT CATS -- the model is never
+    // handed the tool, so it does the only thing it can and describes one.
+    //
+    // Un-filtered LAST, deliberately, and in its own commit: the renderer had to be
+    // provably live first, so this one line can be reverted on its own without
+    // losing it.
   };
 
   var toolsPromise = null;
