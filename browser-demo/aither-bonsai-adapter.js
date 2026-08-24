@@ -459,140 +459,6 @@
     });
   }
 
-  // ── Consent, and where a model may run at all ────────────────────────────────────────
-  // 🚨 DUPLICATED FROM src/lib/bonsai-consent.ts, for the same reason FIRST_TOKEN_FAIL_MS
-  // above is: this file is served as a plain <script> to a page with no bundler, so it
-  // cannot import the shared module. Nothing under public/ is compiled, imported or
-  // type-checked either, so no TypeScript-shaped rule can see this copy — which is exactly
-  // how the shared browser-inference worker drifted from the Living OS copy while carrying a
-  // comment asking people to keep them in step. A comment is not a gate: BCG007 in
-  // check_bonsai_consent_gate.py DIFFS these three values against the canonical module and
-  // fails on any disagreement.
-  //
-  // Owner directive 2026-08-20: nothing downloads without an explicit yes, the yes is only
-  // remembered if the visitor ticks the box, and a reading surface never runs a model at all.
-  var CONSENT_KEY = 'aitheros-bonsai-consent';
-  // The two github.io entries are the upstream GobboNet browser-demo origins:
-  // the ElodineOfficial/gobbonet Pages site, and our fork Pages where a PR is
-  // previewable before it merges. Same doctrine as every other entry — added
-  // because the demo tree deployed there genuinely runs the brain, and the
-  // per-visitor download consent still gates every load.
-  var ALLOWED_HOSTS = ['aitherium.com', 'www.aitherium.com', 'desktop.aitherium.com',
-    'spaces.aitherium.com', 'gobbonet.aitherium.com', 'dgg.aitherium.com',
-    'garg.aitherium.com', 'localhost', '127.0.0.1',
-    'elodineofficial.github.io', 'wizzense.github.io'];
-  var DENIED_PATHS = ['/blog', '/docs', '/media', '/changelog', '/pricing', '/about',
-    '/privacy', '/terms', '/legal', '/help', '/support', '/welcome', '/status'];
-
-  function surfaceRefusal() {
-    var h = String(location.hostname || '').toLowerCase().split(':')[0];
-    if (!h || ALLOWED_HOSTS.indexOf(h) < 0) {
-      return 'The in-browser model runs on aitherium.com only — not on ' + (h || 'this host') + '.';
-    }
-    var p = location.pathname || '/';
-    for (var i = 0; i < DENIED_PATHS.length; i++) {
-      var d = DENIED_PATHS[i];
-      if (p === d || p.indexOf(d + '/') === 0) {
-        return 'The in-browser model does not run on reading surfaces (' + d + ').';
-      }
-    }
-    return null;
-  }
-
-  // Fails CLOSED on unreadable storage or a malformed record — "I could not read the
-  // consent" is not consent.
-  function readConsent() {
-    try {
-      var raw = window.localStorage.getItem(CONSENT_KEY);
-      if (!raw) return null;
-      var v = JSON.parse(raw);
-      if (!v || v.granted !== true) return null;
-      return { granted: true, auto: v.auto === true };
-    } catch (e) { return null; }
-  }
-
-  function writeConsent(auto) {
-    try {
-      window.localStorage.setItem(CONSENT_KEY, JSON.stringify({
-        granted: true, auto: !!auto, at: new Date().toISOString(),
-      }));
-    } catch (e) { /* private mode: the session proceeds, it is just not remembered */ }
-  }
-
-  var consentAsk = null;   // one dialog at a time; concurrent sends share the same promise
-
-  // A minimal dialog rather than a confirm(): a native confirm cannot carry the checkbox,
-  // and the checkbox is the half the owner asked for. Built in the DOM because this page has
-  // no framework.
-  function askConsent() {
-    if (consentAsk) return consentAsk;
-    consentAsk = new Promise(function (resolve) {
-      var wrap = document.createElement('div');
-      wrap.setAttribute('data-testid', 'bonsai-consent-dialog');
-      wrap.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:' +
-        'center;justify-content:center;background:rgba(0,0,0,.7);padding:16px';
-      var cat = webgpuCatalogEntry(modelId);
-      var mb = (cat && cat.sizeMb) || 0;
-      wrap.innerHTML =
-        '<div style="max-width:28rem;width:100%;background:#0b0d13;color:#cbd5e1;border:1px ' +
-        'solid rgba(255,255,255,.1);border-radius:12px;padding:24px;font:14px/1.5 system-ui">' +
-        '<h2 style="margin:0 0 12px;color:#fff;font-size:16px">Run this model on your device?</h2>' +
-        '<p style="margin:0 0 8px">This downloads ' +
-        (mb ? '<strong style="color:#fff">about ' + mb + ' MB</strong>' : 'the model weights') +
-        ' to your browser and runs it on your own GPU. Your conversation stays on this ' +
-        'device — nothing is sent to a server for it.</p>' +
-        '<p style="margin:0 0 16px;color:#94a3b8">The download happens once and is cached.</p>' +
-        '<label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">' +
-        '<input type="checkbox" data-testid="bonsai-consent-auto" style="margin-top:3px">' +
-        '<span>Load automatically on this device from now on</span></label>' +
-        '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:24px">' +
-        '<button data-testid="bonsai-consent-decline" style="padding:8px 16px;border:0;' +
-        'background:transparent;color:#94a3b8;cursor:pointer">Not now</button>' +
-        '<button data-testid="bonsai-consent-accept" style="padding:8px 16px;border:0;' +
-        'border-radius:8px;background:#34d399;color:#000;font-weight:500;cursor:pointer">' +
-        'Download and run</button></div></div>';
-      // The box is DEFAULT OFF and set here, never in the markup: a pre-ticked checkbox is a
-      // default the visitor has to notice to escape, not a decision they made.
-      var box = wrap.querySelector('[data-testid="bonsai-consent-auto"]');
-      box.checked = false;
-      var settled = false;
-      function done(ok) {
-        if (settled) return;
-        settled = true;
-        clearInterval(watch);
-        if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
-        consentAsk = null;
-        if (ok) writeConsent(box.checked);
-        resolve(ok);
-      }
-      // A DETACHED DIALOG COUNTS AS DECLINED. GobboNet re-renders large parts of the page
-      // (thread switches, character edits), and a wrap element removed from the DOM by
-      // anything other than `done` would leave this promise unsettled FOREVER — and the
-      // caller is `ensureReady`, which the model swap awaits. That is a permanent
-      // "Swapping to Bonsai 1.7B (in-browser)..." with nothing on screen to act on, which
-      // is exactly the shape of hang this adapter was reported for on 2026-08-20.
-      // Never leave a promise that gates a visible state machine without a path to settle.
-      var watch = setInterval(function () {
-        if (!wrap.isConnected) done(false);
-      }, 1000);
-      wrap.querySelector('[data-testid="bonsai-consent-accept"]')
-        .addEventListener('click', function () { done(true); });
-      wrap.querySelector('[data-testid="bonsai-consent-decline"]')
-        .addEventListener('click', function () { done(false); });
-      document.body.appendChild(wrap);
-    });
-    return consentAsk;
-  }
-
-  /** Resolves only when a model may actually be downloaded. Rejects with the honest reason. */
-  function requireConsent() {
-    var refusal = surfaceRefusal();
-    if (refusal) return Promise.reject(new Error(refusal));
-    if (readConsent()) return Promise.resolve();
-    return askConsent().then(function (ok) {
-      if (!ok) throw new Error('The in-browser model was not loaded — permission declined.');
-    });
-  }
 
   var origFetch = window.privacyFetch;
   if (typeof origFetch !== 'function') {
@@ -851,6 +717,46 @@
     return next;
   }
 
+  // ── The header dropdown must be REBUILT when detection changes ──────────────────────
+  // GobboNet populates `header-model-select` exactly ONCE, from 24-boot.js:
+  //     loadActiveModel().then(loadModelsList)
+  // and nothing ever calls either again. Both of those fetches are served by the
+  // adapter's own synthetic responses, i.e. they resolve on a MICROTASK, while
+  // probeLocalNode() needs a real loopback round-trip (~15 ms measured on :9001).
+  // So boot ALWAYS wins the race and the dropdown is built from `localNode.base ===
+  // null` — the four in-browser Bonsai sizes and nothing else.
+  //
+  // The banner did not have this problem because it relabels on the TRANSITION, which
+  // is precisely what made the bug so confusing to read: measured 2026-08-23 on the
+  // owner's own machine, the CTA said "⚡ Running on YOUR machine — aither-orchestrator"
+  // while the picker beside it offered only Bonsai, and the adk daemon on :9001 was at
+  // that moment serving SEVENTEEN models. Every one of them was unreachable from this
+  // UI, with nothing anywhere reporting a failure — buildModelsListPayload() was
+  // already correct and was simply never asked again.
+  //
+  // Rebuild on the transitions only, never on every poll: loadModelsList() re-selects
+  // from `active`, so calling it each 4 s would drag a deliberate pick back to the
+  // node's first model seconds after it was made — the same hazard the modelId guard
+  // above exists for. `_lastRosterKey` makes "which models does this node serve"
+  // the trigger, so a node that gains or loses a GGUF mid-session refreshes too.
+  var _lastRosterKey = null;
+  function refreshModelPicker() {
+    var key = localNode.base ? localNode.base + '|' + localNode.models.join(',') : '';
+    if (key === _lastRosterKey) return;
+    _lastRosterKey = key;
+    // Guard on the FUNCTIONS, not on boot having finished: this file is loaded after
+    // js/02-model.js, but boot() awaits IndexedDB, so on a slow first paint the probe
+    // can land before either global is reachable. Skipping is safe — boot's own call
+    // is still ahead of us and will read the now-populated localNode.
+    if (typeof window.loadModelsList !== 'function') return;
+    try {
+      var active = (typeof window.loadActiveModel === 'function')
+        ? window.loadActiveModel() : Promise.resolve();
+      Promise.resolve(active).then(function () { return window.loadModelsList(); })
+        .catch(function () { /* the picker failing must never break chat routing */ });
+    } catch (e) { /* ditto */ }
+  }
+
   function probeLocalNode() {
     return Promise.any(LOCAL_NODE_BASES.map(function (b) {
       // The bearer rides ONLY to the gateway (isGateway); the probe is otherwise
@@ -895,6 +801,10 @@
       if (!localNode.modelId || ids.indexOf(localNode.modelId) === -1) {
         localNode.modelId = ids[0] || 'local-model';
       }
+      // AFTER the roster is set, not beside relabelBackend() above — that runs while
+      // localNode.models is still the PREVIOUS poll's list, so refreshing there would
+      // rebuild the picker from a node whose models had not been read yet.
+      refreshModelPicker();
     }).catch(function () {
       var lost = !!localNode.base;
       if (lost) console.log('[aither] local node lost — falling back to the in-browser model.');
@@ -905,8 +815,45 @@
       // node that reported them -- an offer for something no longer reachable.
       localNode.lockedCount = 0;
       if (lost) relabelBackend();
+      // Both directions. A picker still offering "(your machine)" rows for a node that
+      // has gone away is worse than one that never showed them: picking one fails at
+      // handleSwapModel with 'no local node is currently connected', which reads as the
+      // model being broken rather than the node being gone.
+      refreshModelPicker();
     });
   }
+  // ── ONE ORIGIN MUST NOT HOLD TWO ANSWERS TO "IS THERE A NODE" ───────────────────────
+  // The Living OS asks the same question through src/lib/local-node-optin.ts, and that
+  // module is emphatic for good reasons: aitherium.com/ is PUBLIC and UNAUTHENTICATED,
+  // so loading it must not scan a visitor's loopback unasked. Its grant is deliberately
+  // an EXPLICIT ACT -- "opening the Setup app, or clicking a connect-node affordance".
+  //
+  // This file probes eight loopback ports every 4 s with no such gate, on that same
+  // origin. Reported 2026-08-23: the taskbar read "find my node" (state 'not-probed' --
+  // honest, it had never looked) while this adapter had already found the adk daemon and
+  // the banner beside it said "Running on YOUR machine -- aither-orchestrator". Two
+  // surfaces, one machine, opposite answers, and the OS was the one telling the truth
+  // about what it had measured.
+  //
+  // OPENING GOBBONET IS THAT EXPLICIT ACT. It is not the landing page: it is an app whose
+  // entire subject is local inference, framed same-origin as an OS window
+  // (components/os/website-pages.ts), whose own header says "AWDK ON YOUR MACHINE". A
+  // visitor who opened it has asked the question at least as plainly as one who opened
+  // Setup. So record it in the SAME key the OS reads, rather than keeping a second,
+  // ungoverned answer -- and the OS's `storage` listener flips the chip in the same tick
+  // instead of on its next poll.
+  //
+  // Recording the act does NOT widen it: this adapter was already probing, so nothing
+  // starts scanning that was not scanning before. What changes is that the scan is now
+  // ATTRIBUTABLE and REVOCABLE through the control the OS already ships
+  // (disableLocalNodeProbing / Setup), where before it was neither.
+  var OS_NODE_OPTIN_KEY = 'aither-local-node-probe-optin';
+  try {
+    if (window.localStorage.getItem(OS_NODE_OPTIN_KEY) !== '1') {
+      window.localStorage.setItem(OS_NODE_OPTIN_KEY, '1');
+    }
+  } catch (e) { /* private mode: this session still probes, it just is not remembered */ }
+
   // Fire immediately (don't make the visitor wait a full poll interval to be routed
   // correctly), then keep polling so a node started mid-session is picked up and one
   // that goes away is noticed.
