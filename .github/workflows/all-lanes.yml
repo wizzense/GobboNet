@@ -83,7 +83,19 @@ jobs:
         shell: pwsh
         run: |
           $env:GEMMA_LISTEN_PORT = "8099"
+          # A CI runner cannot answer an interactive prompt, and the guide says
+          # the launcher asks for a password on first start. A server waiting on
+          # one is indistinguishable from a server that failed to bind, so try
+          # the non-interactive shape; the captured log below says whether it
+          # was honoured.
+          $env:GEMMA_PASSWORD = "ci-smoke-not-a-real-secret"
+          # CAPTURE BOTH STREAMS. The first version redirected nothing, so a
+          # failure printed "never served" and no cause -- a red lane that names
+          # nothing is barely a lane.
+          $out = Join-Path $PWD 'fileserver.out.log'
+          $err = Join-Path $PWD 'fileserver.err.log'
           $p = Start-Process pwsh -PassThru -WindowStyle Hidden `
+                 -RedirectStandardOutput $out -RedirectStandardError $err `
                  -ArgumentList '-NoProfile','-File','fileserver.ps1'
           try {
             $ok = $false
@@ -97,7 +109,17 @@ jobs:
                 if ($r.StatusCode -in 200,401) { $ok = $true; break }
               } catch { }
             }
-            if (-not $ok) { Write-Host "::error::fileserver.ps1 never served chat.html"; exit 1 }
+            if (-not $ok) {
+              Write-Host "::error::fileserver.ps1 never served chat.html on :8099"
+              Write-Host "--- exited: $($p.HasExited) ---"
+              foreach ($f in @($out, $err)) {
+                if (Test-Path $f) {
+                  Write-Host "--- $(Split-Path -Leaf $f) ---"
+                  Get-Content $f -Tail 40 | ForEach-Object { Write-Host "  $_" }
+                }
+              }
+              exit 1
+            }
             Write-Host "  fileserver.ps1 is serving"
           } finally { if ($p -and -not $p.HasExited) { $p.Kill() } }
 
