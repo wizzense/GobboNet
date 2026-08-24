@@ -205,6 +205,18 @@
       pageUrl: window.location.href,
       pageTitle: document.title,
       apiBase: API_BASE,
+      // LOCAL-FIRST FOR IMAGES TOO. executeGenerateImage prefers
+      // `{localImageBase}/v1/generate` and only falls to the hosted tier if that
+      // fails -- so pointing it at the node we ALREADY found means a visitor
+      // running `adk up` renders on their own GPU, with no sign-in, exactly the
+      // deal text generation has always had here.
+      //
+      // It is the NODE, not media-forge directly: media-forge sends no CORS
+      // headers at all (measured 2026-08-24: OPTIONS /api/studio/txt2img -> 405),
+      // so a browser cannot call it. The daemon can, and already has the right
+      // origin allowlist. Absent when no node was found, which is correct:
+      // undefined leaves the hosted path exactly as it was.
+      localImageBase: localNode.base || undefined,
       // Deliberately empty: this surface opens nothing, and `apps` is the WHITELIST
       // open_app checks. The tool is filtered out above rather than left to refuse.
       apps: []
