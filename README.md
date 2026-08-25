@@ -209,6 +209,24 @@ Nothing about it phones home. It renders pictures that something else on your ma
 already made, and it holds them in the page only — nothing is uploaded and nothing is
 saved to disk.
 
+The other two mods worth knowing about:
+
+**Bonsai adapter** — routes GobboNet's chat at the AitherOS Bonsai inference
+lane, so the model picker gains Aitherium's ladder (hardware probe, model that
+fits this box, provision, verify). Paste into **Settings → Extensions**:
+
+
+
+**EllenSue** — a ready-made character, a deductive research assistant adapted
+from the ELLENSUE v6.9 engine by Qberticus (GoblinCorps Discord). Save the
+file, then import it from the character screen (it is a standard chara_card_v2
+JSON, so it works in anything that reads character cards):
+
+
+
+The hosted demo at gobbonet.aitherium.com ships her in its default roster, so
+there she is ready without importing anything.
+
 ### Making your own thing send pictures to it
 
 This is the useful part if you're building a mod. The gallery does not care who made
