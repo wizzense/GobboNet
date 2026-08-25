@@ -240,6 +240,24 @@ it broke after a few images":
 
 ---
 
+## Characters (optional) — EllenSue, a deductive research assistant
+
+A ready-made character you can import. EllenSue is an adaptation of the
+ELLENSUE v6.9 research-assistant engine written by Qberticus (GoblinCorps
+Discord). She quarantines unknowns instead of inventing them, holds rival
+explanations in superposition, and ends every analysis the honest way: what
+was learned, and what was eliminated.
+
+Save this file, then import it from the character screen (it is a standard
+chara_card_v2 JSON, so it works in anything that reads character cards):
+
+```
+https://gobbonet.aitherium.com/ellensue.json
+```
+
+The hosted demo at gobbonet.aitherium.com also ships her in its default
+roster, so there she is ready without importing anything.
+
 ## Keeping it private and safe
 
 This tool was built to be private, but a few honest notes:
