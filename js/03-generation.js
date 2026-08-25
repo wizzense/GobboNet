@@ -163,14 +163,12 @@ function findLastSentenceEnd(text, uptoIdx) {
  */
 function maybeApplySmartLimit(msg) {
   if (msg.smartCapped) return true;
-  // Per-card. A code assistant and a DM want very different reply lengths,
-  // which one global number could never serve.
-  const sl = resolveSmartLimit(typeof getActiveCard === 'function' ? getActiveCard() : null);
-  if (!sl.enabled) return false;
+  const s = state.settings || {};
+  if (!s.smartLimitEnabled) return false;
   const text = msg.content || '';
   if (!text) return false;
 
-  const limit = sl.tokens;
+  const limit = Math.min(8192, Math.max(25, parseInt(s.smartLimitTokens, 10) || 300));
   const est = estimateTokens(text);
   if (est < limit) return false;
 

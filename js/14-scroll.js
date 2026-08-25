@@ -311,10 +311,8 @@ function renderStreamingUpdate(assistantMsg) {
 
   // ── Surgical updates ───────────────────────────────────────────
   const card        = getActiveCard();
-  // Must agree with renderMessages (13-dashboard.js) or a message would
-  // change colour the moment streaming ends and the final repaint lands.
-  const aiTextColor   = card.textColor   || FALLBACK_CARD_TEXT_COLOR;
-  const aiDialogColor = card.dialogColor || FALLBACK_CARD_DIALOG_COLOR;
+  const aiTextColor = card.textColor || '';
+  const aiDialogColor = card.dialogColor || '';
 
   // Update COT text — scoped to the active streaming message (see note above).
   if (hasReasoning) {
