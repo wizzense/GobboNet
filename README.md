@@ -215,14 +215,18 @@ The other two mods worth knowing about:
 lane, so the model picker gains Aitherium's ladder (hardware probe, model that
 fits this box, provision, verify). Paste into **Settings → Extensions**:
 
-
+```
+https://gobbonet.aitherium.com/aither-bonsai-adapter.js
+```
 
 **EllenSue** — a ready-made character, a deductive research assistant adapted
 from the ELLENSUE v6.9 engine by Qberticus (GoblinCorps Discord). Save the
 file, then import it from the character screen (it is a standard chara_card_v2
 JSON, so it works in anything that reads character cards):
 
-
+```
+https://gobbonet.aitherium.com/ellensue.json
+```
 
 The hosted demo at gobbonet.aitherium.com ships her in its default roster, so
 there she is ready without importing anything.
