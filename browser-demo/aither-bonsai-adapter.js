@@ -98,28 +98,6 @@
     var cands = [];
     try { if (ADAPTER_DIR) cands.push(new URL('workers/' + name, ADAPTER_DIR).href); }
     catch (e) { /* an unparseable base is simply not a candidate */ }
-    // 🚨 THE CANDIDATE THAT MAKES AN EXTENSION INSTALL POSSIBLE. GobboNet can load this
-    // adapter through its own Extensions panel, from a URL, onto a VANILLA install
-    // running at 127.0.0.1:PORT. Neither existing candidate finds the engine there:
-    // adapter-relative gives `<origin>/gobbonet/workers/...` (the workers are at the
-    // site ROOT, not beside the adapter) and page-origin gives
-    // `http://127.0.0.1:PORT/workers/...`, which that install has never heard of. Both
-    // 404, and `new Worker` on a 404 dies as an opaque "crashed before it could start"
-    // -- the exact failure this function was written to stop, one deployment shape
-    // over.
-    //
-    // Resolving the ABSOLUTE PATH against the ADAPTER'S OWN ORIGIN is the rule that
-    // holds everywhere: the engine lives at /workers/ on whichever origin serves the
-    // adapter. On our own pages this is identical to the page-origin candidate and
-    // costs one cached HEAD; loaded as an extension it is the only one that resolves.
-    //
-    // A cross-origin engine is legal here because the worker is constructed with
-    // `{ type: 'module' }` and the origin sends CORS with a JS MIME type (verified
-    // 2026-08-24: aitherium.com/workers/webgpu-brain-bonsai-worker.js -> 200,
-    // application/javascript, access-control-allow-origin: *). A CLASSIC worker would
-    // be blocked cross-origin no matter what the headers said.
-    try { if (ADAPTER_DIR) cands.push(new URL(absolutePath, ADAPTER_DIR).href); }
-    catch (e) { /* not a candidate */ }
     try { cands.push(new URL(absolutePath, window.location.origin).href); }
     catch (e) { cands.push(absolutePath); }
     var last = cands[cands.length - 1];
@@ -167,17 +145,8 @@
   var UNSUPPORTED_TOOLS = {
     open_app: 'this page is a chat, not the desktop -- there is no window to open',
     list_apps: 'no app surface here, so the list is always empty',
-    search_knowledge: 'needs an anon platform identity this page never mints'
-    // generate_image was HERE until 2026-08-24, with the reason 'the worker returns
-    // images on a channel this page does not render'. That is no longer true: the
-    // image mod renders them, this file dispatches `gobbonet:image` to it, and both
-    // halves are verified live on every origin. Filtering it out now is what makes
-    // `/imagine a cat` answer with a PARAGRAPH ABOUT CATS -- the model is never
-    // handed the tool, so it does the only thing it can and describes one.
-    //
-    // Un-filtered LAST, deliberately, and in its own commit: the renderer had to be
-    // provably live first, so this one line can be reverted on its own without
-    // losing it.
+    search_knowledge: 'needs an anon platform identity this page never mints',
+    generate_image: 'the worker returns images on a channel this page does not render'
   };
 
   var toolsPromise = null;
@@ -193,18 +162,7 @@
     }
     toolsPromise = new Promise(function (resolve) {
       var s = document.createElement('script');
-      // Adapter-relative, for the same reason as the engine above: `TOOLS_URL` is a
-      // root-relative path that only resolves on an origin laid out like ours, and as
-      // an extension this runs on someone else's. The registry sits BESIDE the adapter
-      // on every origin that serves it, so its own directory is the right base.
-      //
-      // This one degrades rather than breaks -- `onerror` resolves null and chat
-      // continues without tools -- which is precisely why it would have gone unnoticed:
-      // the model still answers, it just quietly cannot tell the time.
-      var toolsSrc = TOOLS_URL;
-      try { if (ADAPTER_DIR) toolsSrc = new URL('bonsai-tools.js', ADAPTER_DIR).href; }
-      catch (e) { /* keep the root-relative path */ }
-      s.src = toolsSrc;
+      s.src = TOOLS_URL;
       s.async = true;
       s.onload = function () { resolve(window.AitherBonsaiTools || null); };
       s.onerror = function () {
@@ -238,20 +196,6 @@
       pageUrl: window.location.href,
       pageTitle: document.title,
       apiBase: API_BASE,
-      // LOCAL-FIRST FOR IMAGES TOO. executeGenerateImage prefers
-      // `{localImageBase}/v1/generate` and only falls to the hosted tier if that
-      // fails -- so pointing it at the node we ALREADY found means a visitor
-      // running `adk up` renders on their own GPU, with no sign-in, exactly the
-      // deal text generation has always had here.
-      //
-      // It is the NODE, not media-forge directly: media-forge sends no CORS
-      // headers at all (measured 2026-08-24: OPTIONS /api/studio/txt2img -> 405),
-      // so a browser cannot call it. The daemon can, and already has the right
-      // origin allowlist. Absent when no node was found, which is correct:
-      // undefined leaves the hosted path exactly as it was.
-      // The visitor's chosen image backend, which is NOT necessarily the chat
-      // node: someone can run ComfyUI for pictures and nothing for text.
-      localImageBase: resolveImageBase(),
       // Deliberately empty: this surface opens nothing, and `apps` is the WHITELIST
       // open_app checks. The tool is filtered out above rather than left to refuse.
       apps: []
@@ -394,7 +338,7 @@
   // per-visitor download consent still gates every load.
   var ALLOWED_HOSTS = ['aitherium.com', 'www.aitherium.com', 'desktop.aitherium.com',
     'spaces.aitherium.com', 'gobbonet.aitherium.com', 'dgg.aitherium.com',
-    'garg.aitherium.com', 'vibe.aitherium.com', 'localhost', '127.0.0.1',
+    'garg.aitherium.com', 'localhost', '127.0.0.1',
     'elodineofficial.github.io', 'wizzense.github.io'];
   var DENIED_PATHS = ['/blog', '/docs', '/media', '/changelog', '/pricing', '/about',
     '/privacy', '/terms', '/legal', '/help', '/support', '/welcome', '/status'];
@@ -553,15 +497,14 @@
     'http://127.0.0.1:8080', // bare llama.cpp llama-server (aitherium.com/phone.sh)
     'http://127.0.0.1:8092', // aither-llamacpp-bonsai, the fleet's own local Bonsai container
     'http://127.0.0.1:9001', // awdk's daemon (adk up)
-    // The MCP gateway. Plain HTTP on loopback and therefore the ONE fleet surface a
-    // browser can actually reach: MicroScheduler serves the real model roster on :8150
-    // but over TLS with an internal-CA cert no browser can validate, which is exactly
-    // why :8490 was removed from the Living Desktop's list on 2026-07-30. Adding an
-    // internal-CA port here would look right on this machine (where the CA is installed)
-    // and fail silently on every visitor's.
-    // Requires the CORS + Private-Network-Access layer added to the gateway in
-    // e295f3b56b; before that it answered 200 and the browser discarded it.
-    'http://127.0.0.1:8182',
+    // The MCP gateway (:8182) is DELIBERATELY NOT in this list. It is the FLEET, not
+    // "your machine" — probing it made the picker hijack the demo's default (the
+    // in-browser Bonsai WebGPU model, which needs NO server and NO sign-in) and route
+    // chat to a tiered fleet endpoint that 401s without a bearer the demo never asked
+    // for. Measured 2026-08-25: owner-facing 401 "llama-server returned 401:
+    // Unauthorized" with "Aither Small (your machine)" in the picker. This demo's
+    // onramp is in-browser Bonsai plus genuine local nodes; the fleet returns only
+    // when the gateway grows an explicit opt-in surface, not a port-scan.
     // :8889 — the port the platform's OWN self-host playbook tells people to use.
     // `.claude/skills/selfhost-bonsai` names it sixteen times ("llama-server ... --listen
     // 127.0.0.1 --port 8889 -np 1"), and NEITHER probe list had it. So a stranger who
@@ -570,149 +513,6 @@
     // about a number, with nothing comparing them. Asserted now by LNP002.
     'http://127.0.0.1:8889',
   ];
-  // ── LOCAL IMAGE BACKENDS ───────────────────────────────────────────────────────
-  // 🚨 A LOCALLY-RUNNING ComfyUI COULD NEVER BE FOUND, AND THE REASON IS THAT THE
-  // PROBE ABOVE IS LLM-SHAPED. `LOCAL_NODE_BASES` asks every candidate for
-  // `/v1/models`; ComfyUI does not serve that route at all, so :8188 could sit there
-  // answering perfectly and this page would report no local image backend. It is the
-  // same class as :8889 above -- a real service on a port nothing asked the right
-  // question of -- except the question, not the port, was what was missing.
-  //
-  // So each entry carries its OWN liveness route. A single shared path is what caused
-  // the bug being fixed here.
-  //
-  // 127.0.0.1, never "localhost": measured on this fleet, ::1 REFUSES after ~2120 ms
-  // while IPv4 connects in 3 ms, so the name form costs a two-second stall per probe.
-  var LOCAL_IMAGE_BACKENDS = [
-    // ComfyUI's own status route. Present since the earliest builds and served on the
-    // same origin as the UI, so if a visitor can open ComfyUI they can reach this.
-    // 🚨 MEASURED AGAINST A REAL ComfyUI (v0.3.71) RUNNING ON THIS BOX: a request
-    // carrying an `Origin` header gets **403 Forbidden**. Without one -- curl, or any
-    // non-browser client -- the same URL returns 200. ComfyUI does not merely omit CORS
-    // headers; it REFUSES cross-origin callers outright unless started with
-    // `--enable-cors-header`, and that flag is not in its default argv.
-    //
-    // So a browser can never reach a stock ComfyUI, and the honest failure is not "no
-    // backend found" -- it is "your ComfyUI is right there and will not talk to a web
-    // page". `remedy` is what makes that difference sayable; see probeImageBackends.
-    { id: 'comfyui', label: 'ComfyUI (local)', base: 'http://127.0.0.1:8188',
-      probe: '/system_stats',
-      remedy: 'ComfyUI is running on :8188 but refuses browser requests. '
-        + 'Restart it with --enable-cors-header to use it from this page.' },
-    // awdk's daemon. It fronts media-forge, which a browser CANNOT call directly --
-    // measured 2026-08-24, media-forge answers OPTIONS /api/studio/txt2img with 405 and
-    // sends no CORS headers at all. The daemon has the origin allowlist.
-    { id: 'awdk', label: 'awdk daemon', base: 'http://127.0.0.1:9001',
-      probe: '/v1/models' },
-    // The platform's own in-browser image service, when someone is running it locally.
-    { id: 'bonsai-image', label: 'Bonsai Image (local)', base: 'http://127.0.0.1:8798',
-      probe: '/health' },
-  ];
-  //: Where the visitor's choice lives. A CHOICE, not a cache: it must survive a reload,
-  //: because a visitor who picked their own ComfyUI and got the hosted tier back after
-  //: refreshing would reasonably conclude the picker does nothing.
-  var IMAGE_BACKEND_KEY = 'aither.imageBackend';
-  var IMAGE_BACKEND_EVENT = 'gobbonet:image-backends';
-  //: Discovered backends, by id. `auto` is not in here -- it is the absence of a choice.
-  var imageBackends = {};
-
-  function readImageChoice() {
-    try { return window.localStorage.getItem(IMAGE_BACKEND_KEY) || 'auto'; }
-    catch (e) { return 'auto'; }   // private mode throws on ACCESS, not just on write
-  }
-
-  function writeImageChoice(id) {
-    try { window.localStorage.setItem(IMAGE_BACKEND_KEY, id); } catch (e) { /* ignore */ }
-  }
-
-  // The base the current turn should render on. `auto` prefers a discovered image
-  // backend and falls back to the chat node, which is what shipped before this existed.
-  function resolveImageBase() {
-    var choice = readImageChoice();
-    if (choice === 'hosted') return undefined;          // deliberately off-box
-    if (choice !== 'auto' && imageBackends[choice]) return imageBackends[choice].base;
-    var ids = Object.keys(imageBackends);
-    if (ids.length) return imageBackends[ids[0]].base;
-    return localNode.base || undefined;
-  }
-
-  //: Backends that ARE listening but will not serve a browser, by id -> remedy text.
-  //: Kept apart from `imageBackends` on purpose: these must never appear in the picker,
-  //: because selecting one would route at a service that answers 403 to this page.
-  var imageBlocked = {};
-
-  function probeImageBackends() {
-    return Promise.all(LOCAL_IMAGE_BACKENDS.map(function (b) {
-      return fetch(b.base + b.probe,
-                   { signal: AbortSignal.timeout(1500), cache: 'no-store' })
-        .then(function (res) { return res.ok ? { b: b, ok: true } : { b: b, ok: false }; })
-        .catch(function () { return { b: b, ok: false }; })
-        .then(function (r) {
-          if (r.ok || !r.b.remedy) return r;
-          // 🚨 THE DIFFERENCE BETWEEN "NOT RUNNING" AND "RUNNING AND REFUSING US" IS
-          // INVISIBLE TO THE PROBE ABOVE -- a 403 and a closed port both land in the
-          // same .catch. A `no-cors` request resolves to an OPAQUE response whenever
-          // something answered at all, and rejects only when nothing is listening, so
-          // it separates the two. Its body and status are unreadable, which is fine:
-          // the only question here is whether anyone is home.
-          return fetch(r.b.base + r.b.probe,
-                       { mode: 'no-cors', signal: AbortSignal.timeout(1500),
-                         cache: 'no-store' })
-            .then(function () { return { b: r.b, ok: false, listening: true }; })
-            .catch(function () { return r; });
-        });
-    })).then(function (results) {
-      var next = {};
-      var blocked = {};
-      results.forEach(function (r) {
-        if (r.ok) next[r.b.id] = r.b;
-        else if (r.listening) blocked[r.b.id] = r.b.remedy;
-      });
-      var blockedBefore = Object.keys(imageBlocked).sort().join(',');
-      imageBlocked = blocked;
-      if (Object.keys(blocked).sort().join(',') !== blockedBefore) {
-        Object.keys(blocked).forEach(function (k) {
-          // console.warn, not silence: this is the one state where a visitor can
-          // actually fix it in ten seconds, and saying nothing guarantees they will not.
-          console.warn('[aither] ' + blocked[k]);
-        });
-      }
-      var found = results.map(function (r) { return r.ok ? r.b : null; });
-      var before = Object.keys(imageBackends).sort().join(',');
-      var after = Object.keys(next).sort().join(',');
-      imageBackends = next;
-      // Announce only on CHANGE. A picker that re-renders every four seconds discards
-      // the open <select> under the visitor's cursor.
-      if (before !== after) {
-        console.log('[aither] local image backends: ' + (after || 'none'));
-        try {
-          window.dispatchEvent(new CustomEvent(IMAGE_BACKEND_EVENT, {
-            detail: {
-              backends: Object.keys(next).map(function (k) {
-                return { id: k, label: next[k].label };
-              }),
-              // Listening, but refusing this page. NOT selectable -- surfaced so the
-              // picker can say why a backend the visitor knows is running is absent.
-              blocked: Object.keys(blocked).map(function (k) {
-                return { id: k, remedy: blocked[k] };
-              }),
-              choice: readImageChoice()
-            }
-          }));
-        } catch (e) { /* CustomEvent unavailable: discovery still works */ }
-      }
-      return next;
-    });
-  }
-
-  // The picker writes back through this. Exposed on the namespace rather than as a
-  // second event listener so the mod cannot set a backend that was never discovered.
-  function setImageBackend(id) {
-    if (id !== 'auto' && id !== 'hosted' && !imageBackends[id]) return false;
-    writeImageChoice(id);
-    return true;
-  }
-
   var LOCAL_NODE_POLL_MS = 4000;
   // `models` is EVERY id the node serves, not just the first. A node running adk can
   // hold several GGUFs, and taking data[0] exposed exactly one of them to the picker —
@@ -1059,32 +859,6 @@
   probeLocalNode();
   setInterval(probeLocalNode, LOCAL_NODE_POLL_MS);
 
-  // Image backends ride the SAME cadence. A separate timer would drift against the one
-  // above and double the loopback traffic for no benefit; a visitor who starts ComfyUI
-  // mid-session is picked up within one interval either way.
-  probeImageBackends();
-  setInterval(probeImageBackends, LOCAL_NODE_POLL_MS);
-
-  // The picker's only door. Exposed as a function rather than a settable field so a
-  // backend that was never discovered cannot be selected -- `setImageBackend` returns
-  // false and the UI keeps its previous value, instead of the page silently routing at
-  // a port with nothing behind it.
-  window.AitherImageBackends = {
-    list: function () {
-      return Object.keys(imageBackends).map(function (k) {
-        return { id: k, label: imageBackends[k].label };
-      });
-    },
-    choice: readImageChoice,
-    blocked: function () {
-      return Object.keys(imageBlocked).map(function (k) {
-        return { id: k, remedy: imageBlocked[k] };
-      });
-    },
-    set: setImageBackend,
-    event: IMAGE_BACKEND_EVENT
-  };
-
   // ── Worker lifecycle ─────────────────────────────────────────────────────────────────
   var worker = null;
   var ready = false;
@@ -1119,28 +893,6 @@
 
     w.onmessage = function (ev) {
       var msg = ev.data || {};
-
-      // IMAGES ARE READ STRUCTURALLY, BEFORE THE SWITCH — the same move the
-      // desktop surface makes (webgpu-brain.tsx). The worker has its OWN
-      // protocol, so a message type can be on the wire before anything here
-      // knows it exists; reading the shape is a read, not a fork. Doing it in
-      // the switch would also mean a `default` that swallows it silently.
-      //
-      // Dispatching a plain CustomEvent rather than rendering here is the
-      // point: the wire protocol and the rendering can then change without
-      // touching each other, and ANY mod — including a community ComfyUI one
-      // — can raise the same event and get the same gallery for free.
-      if (msg.type === 'image' && Array.isArray(msg.images)) {
-        var srcs = msg.images.map(function (i) {
-          return i && (i.dataUrl || i.url || i.src);
-        }).filter(Boolean);
-        if (srcs.length) {
-          window.dispatchEvent(new CustomEvent('gobbonet:image',
-            { detail: { images: srcs } }));
-        }
-        return;
-      }
-
       switch (msg.type) {
         case 'ready':
           ready = true;
@@ -1152,14 +904,11 @@
           readyWaiters.splice(0).forEach(function (x) { x.resolve(); });
           break;
         case 'tool_action':
-          // Named explicitly so it is DECLINED, not silently swallowed by falling
-          // off the switch. It is honoured on the desktop surface and cannot be
-          // here (there is no window to open); the tools that raise it are filtered
-          // out of the request for exactly that reason, so reaching this arm means
-          // the filter has a hole.
-          //
-          // `image` USED to be declined alongside it. It no longer is — it is
-          // dispatched above as `gobbonet:image`, which the image mod renders.
+        case 'image':
+          // Named explicitly so they are DECLINED, not silently swallowed by falling
+          // off the switch. Both are honoured on the desktop surface and cannot be
+          // here; the tools that raise them are filtered out of the request for exactly
+          // that reason, so reaching this arm means the filter has a hole.
           break;
         case 'progress':
           // The worker reports a FINISHED TOOL CALL as a progress line carrying `file`
@@ -1533,7 +1282,11 @@
       var ids = localNode.models.length ? localNode.models : [localNode.modelId];
       ids.forEach(function (id) {
         models.push({
-          file: 'local-node:' + id, id: id, name: prettifyId(id) + ' (your machine)',
+          // The gateway serves the FLEET's free tier (anonymous chat is served
+          // by it, but it is not the visitor's own hardware) — label it honestly
+          // so "your machine" is not a claim the page cannot back.
+          file: 'local-node:' + id, id: id,
+          name: prettifyId(id) + (isGateway(localNode.base) ? ' (Aitherium free tier)' : ' (your machine)'),
           family: 'custom', thinkingFormat: 'none',
           active: localActive && id === localNode.modelId,
         });
@@ -1558,7 +1311,8 @@
   function buildActiveModelPayload() {
     if (preferLocalNode && localNode.base) {
       return {
-        ggufFile: localNode.modelId, id: localNode.modelId, name: prettifyId(localNode.modelId) + ' (your machine)',
+        ggufFile: localNode.modelId, id: localNode.modelId,
+        name: prettifyId(localNode.modelId) + (isGateway(localNode.base) ? ' (Aitherium free tier)' : ' (your machine)'),
         family: 'custom', maxCtx: 131072, defaultCtx: 24576, thinkingFormat: 'none',
       };
     }
@@ -1694,17 +1448,10 @@
   // first time a surface moves, and today already produced three "this host serves that"
   // assumptions that were wrong.
   var SEARCH_API_HOST = 'https://portal.aitherium.com';
-  // The fallback host serves the QUERY route, not /web: measured 2026-08-26,
-  // portal /api/search/web answers 401 (auth required) while /api/search/query
-  // answers 200 public with CORS for this origin. /api/search/web is correct
-  // only on Veil origins (desktop.aitherium.com answers 200); the apex is a
-  // Pages export with no API routes at all.
-  var SEARCH_API_PATH = '/api/search/query';
-  var SEARCH_SAME_ORIGIN_PATH = '/api/search/web';
   var _searchBase = null;   // null = not yet decided, '' = same-origin works
 
-  function searchOnce(base, path, body) {
-    return origWindowFetch(base + path, {
+  function searchOnce(base, body) {
+    return origWindowFetch(base + '/api/search/web', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
@@ -1721,17 +1468,14 @@
     });
 
     var attempt = _searchBase === null
-      ? searchOnce('', SEARCH_SAME_ORIGIN_PATH, body).then(function (r) {
+      ? searchOnce('', body).then(function (r) {
           // 405/404 means THIS ORIGIN does not serve API routes (the Pages case). Anything
           // else — including a 429 from the throttle — is a real answer from a real route.
           if (r.status !== 405 && r.status !== 404) { _searchBase = ''; return r; }
           _searchBase = SEARCH_API_HOST;
-          return searchOnce(_searchBase, SEARCH_API_PATH, body);
+          return searchOnce(_searchBase, body);
         })
-      : searchOnce(
-          _searchBase,
-          _searchBase === SEARCH_API_HOST ? SEARCH_API_PATH : SEARCH_SAME_ORIGIN_PATH,
-          body);
+      : searchOnce(_searchBase, body);
 
     return attempt.catch(function (err) {
       // Upstream reads a non-OK as "search unavailable" and carries on; give it a parseable
