@@ -85,10 +85,22 @@ const DEFAULT_SETTINGS = {
 // Each entry: { id, name, url, raw } — url and/or inline raw, both optional
 // (raw applies after the url for that entry). Legacy single-field saves
 // (cssUrl/cssRaw/jsUrl/jsRaw) are migrated on load by migrateExtensions().
+//
+// The entries below are the shipped GobboNet mods (see
+// .PRODUCTS/.GOBBONET/MODS.md). They used to load as hard <link>/<script>
+// tags in chat.html; they now ride the extensions path so the panel shows
+// what is actually loaded. 05-persistence.js seeds them onto existing users
+// exactly once (stable ids — a user who removes one is never re-seeded).
 const DEFAULT_EXTENSIONS = {
-  enabled: false,
-  styles: [],
-  scripts: []
+  enabled: true,
+  styles: [
+    { id: 'mod_css_image_renderer', name: 'Image Renderer (shipped mod)', url: 'image-renderer.css', raw: '' }
+  ],
+  scripts: [
+    { id: 'mod_js_bonsai_adapter', name: 'Aither Bonsai Adapter (shipped mod)', url: 'aither-bonsai-adapter.js', raw: '' },
+    { id: 'mod_js_image_renderer', name: 'Image Renderer (shipped mod)', url: 'image-renderer.js', raw: '' },
+    { id: 'mod_js_mediaforge', name: 'Media Forge (awforge mod)', url: 'mediaforge.js', raw: '' }
+  ]
 };
 
 // Normalize any saved/imported extensions blob into the array-based shape,
@@ -194,6 +206,11 @@ let state = {
   folders: [],
   extensions: { ...DEFAULT_EXTENSIONS },
   macros: DEFAULT_MACROS.map(m => ({ ...m })),
+  // Tracks which shipped-mod extension ids have already been seeded onto
+  // this user's state. Same contract as seededDefaultMacros: each default
+  // mod is seeded at most once per user, so deleting one in the panel
+  // sticks across reloads.
+  seededDefaultExtensions: [],
   // Tracks which DEFAULT_MACROS triggers have already been seeded onto
   // this user's state. Lets us add new default macros in future versions
   // without re-adding ones the user intentionally deleted. See loadState.
