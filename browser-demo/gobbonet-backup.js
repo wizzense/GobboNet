@@ -56,7 +56,8 @@
     }).then(function (r) {
       if (!r.ok && r.status !== 422) {
         return r.json().then(function (j) {
-          throw new Error((j.message || ("HTTP " + r.status)) + " (path " + path + ")");
+          throw new Error((j.message || ("HTTP " + r.status)) +
+            " (HTTP " + r.status + ", path " + path + ")");
         });
       }
       return r;
@@ -111,6 +112,19 @@
           method: "POST",
           body: JSON.stringify({ tag_name: tag, name: "Backup " + tag, draft: true }),
         }).then(function (r2) { return r2.json(); });
+      })
+      .catch(function (e) {
+        // The tag lookup 404s for a release that does not exist YET — that is
+        // the ordinary FIRST backup, not an error (measured 2026-08-27 by the
+        // round-trip harness: without this, the create-if-missing branch was
+        // unreachable and every first backup failed). Re-throw anything else.
+        if (/HTTP 404/.test(e.message || "")) {
+          return api(token, "/repos/" + owner + "/" + repo + "/releases", {
+            method: "POST",
+            body: JSON.stringify({ tag_name: tag, name: "Backup " + tag, draft: true }),
+          }).then(function (r2) { return r2.json(); });
+        }
+        throw e;
       });
   }
 
@@ -170,8 +184,14 @@
         var total = 0;
         function uploadOne(file) {
           var entry = { name: file.name, size: file.size, parts: [] };
+          // The whole-file plain hash the restore checks against — recorded
+          // here, or the restore's final verification compares against
+          // undefined and always fails (measured 2026-08-27 by the round-trip
+          // harness). One extra read of a local file; acceptable.
           var nParts = Math.max(1, Math.ceil(file.size / PART_SIZE));
-          var chain = Promise.resolve();
+          var chain = file.arrayBuffer()
+            .then(function (whole) { return sha256Hex(new Uint8Array(whole)); })
+            .then(function (h) { entry.plain_sha256 = h; });
           for (var p = 0; p < nParts; p++) {
             (function (idx) {
               chain = chain.then(function () {
@@ -242,9 +262,14 @@
                     return decryptPart(key, p.iv, new Uint8Array(buf));
                   });
                 }).then(function (plain) {
-                  parts.push(new Blob([plain]));
-                  done++;
-                  onProgress && onProgress(file.name, done, file.parts.length * manifest.files.length);
+                  return sha256Hex(new Uint8Array(plain)).then(function (plainGot) {
+                    if (plainGot !== p.plain_sha256) {
+                      throw new Error("part " + p.name + " failed plaintext sha256 after decrypt");
+                    }
+                    parts.push(new Blob([plain]));
+                    done++;
+                    onProgress && onProgress(file.name, done, file.parts.length * manifest.files.length);
+                  });
                 });
               });
             });
@@ -381,5 +406,12 @@
     document.body.appendChild(panel());
   } else {
     document.addEventListener("DOMContentLoaded", function () { document.body.appendChild(panel()); });
+  }
+
+  // Test seam: the encrypt/chunk/upload/restore core, exposed for the
+  // round-trip harness (gobbonet-backup.roundtrip.mjs) — the same spirit
+  // as the gobbonet:image event contract: a seam, not a phone-home.
+  if (typeof window !== "undefined") {
+    window.__gobbonetBackup = { backupFiles: backupFiles, restoreBackup: restoreBackup };
   }
 })();
