@@ -44,20 +44,29 @@
   function api(token, path, opts) {
     opts = opts || {};
     var headers = {
-      Authorization: "Bearer " + token,
       Accept: opts.accept || "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
+      // Browsers ignore a set User-Agent (forbidden header) and send their own,
+      // so this only matters for node callers (the round-trip harness, the
+      // gate page's fetch) — the GitHub API rejects requests with no UA at all.
+      "User-Agent": "gobbonet-backup-mod",
     };
+    // Tokenless reads: public repos serve their releases/assets without auth —
+    // the gate page (backup-gate.html) shares backups this way.
+    if (token) headers.Authorization = "Bearer " + token;
     if (opts.body !== undefined) headers["Content-Type"] = opts.contentType || "application/json";
-    return fetch("https://api.github.com" + path, {
+    var url = /^https?:\/\//.test(path) ? path : "https://api.github.com" + path;
+    return fetch(url, {
       method: opts.method || "GET",
       headers: headers,
       body: opts.body,
     }).then(function (r) {
       if (!r.ok && r.status !== 422) {
         return r.json().then(function (j) {
-          throw new Error((j.message || ("HTTP " + r.status)) +
+          var e = new Error((j.message || ("HTTP " + r.status)) +
             " (HTTP " + r.status + ", path " + path + ")");
+          e.status = r.status;
+          throw e;
         });
       }
       return r;
@@ -128,9 +137,14 @@
       });
   }
 
-  function uploadAsset(token, owner, repo, releaseId, name, bytes) {
-    return api(token, "/repos/" + owner + "/" + repo + "/releases/" + releaseId +
-      "/assets?name=" + encodeURIComponent(name), {
+  function uploadAsset(token, uploadUrl, name, bytes) {
+    // api.github.com's .../assets?name= upload route returns 404 (measured
+    // 2026-08-27 against real releases with every token class and repo shape
+    // tried — private and org, draft and published, empty and seeded). The
+    // release payload's upload_url (uploads.github.com) is the host the gh CLI
+    // uses and the only one that accepts uploads.
+    var url = uploadUrl.replace("{?name,label}", "?name=") + encodeURIComponent(name);
+    return api(token, url, {
       method: "POST",
       body: bytes,
       contentType: "application/octet-stream",
@@ -170,12 +184,50 @@
   // The flow
   // ----------------------------------------------------------------------
 
+  function seedEmptyRepo(token, owner, repo) {
+    // GitHub refuses to PUBLISH a release in a repo with zero commits
+    // ("Repository is empty.", 422) — exactly the state of a brand-new private
+    // repo, which is the ordinary FIRST backup (measured 2026-08-27 by the
+    // real-API round-trip: the final publish 422s until the repo has content).
+    // One init README commit makes the repo real. The commits probe is the only
+    // reliable emptiness signal — `size` stays 0 for tiny repos and pushed_at
+    // is set at creation. A 422 on the PUT just means content already exists.
+    return api(token, "/repos/" + owner + "/" + repo + "/commits?per_page=1")
+      .then(function (r) { return r.json(); })
+      .catch(function (e) {
+        // An empty repo answers the commits probe with 409 "Git Repository is
+        // empty." (measured 2026-08-27 against the real API) — that IS the
+        // empty signal; proceed to seed.
+        if (e.status === 409) return [];
+        throw e;
+      })
+      .then(function (commits) {
+        if (commits.length > 0) return null;
+        return api(token, "/repos/" + owner + "/" + repo + "/contents/README.md", {
+          method: "PUT",
+          body: JSON.stringify({
+            message: "init: backup repo",
+            content: btoa("Backups for " + owner + "/" + repo +
+              "\nCreated by the GobboNet backup mod. Contents are encrypted; the passphrase is the key.\n"),
+          }),
+        }).then(function (r2) {
+          if (!r2.ok && r2.status !== 422) {
+            return r2.json().then(function (j) {
+              throw new Error("could not seed the empty repo: " + (j.message || ("HTTP " + r2.status)));
+            });
+          }
+        });
+      });
+  }
+
   function backupFiles(token, owner, repo, passphrase, files, onProgress) {
     var salt = toHex(crypto.getRandomValues(new Uint8Array(16)));
     var tag = "backup-" + new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
+    return seedEmptyRepo(token, owner, repo).then(function () {
     return deriveKey(passphrase, salt).then(function (key) {
       return ensureRelease(token, owner, repo, tag).then(function (rel) {
         var releaseId = rel.id;
+        var uploadUrl = rel.upload_url;
         var manifest = {
           version: 1,
           kdf: "pbkdf2-sha256", iterations: ITERATIONS, salt: salt,
@@ -202,7 +254,7 @@
                     return encryptPart(key, new Uint8Array(raw)).then(function (enc) {
                       return sha256Hex(enc.cipher).then(function (ctSha) {
                         var partName = file.name + ".part" + idx;
-                        return uploadAsset(token, owner, repo, releaseId, partName, enc.cipher)
+                        return uploadAsset(token, uploadUrl, partName, enc.cipher)
                           .then(function () {
                             entry.parts.push({
                               name: partName, size: enc.cipher.length,
@@ -228,7 +280,7 @@
           return sha256Hex(new TextEncoder().encode(JSON.stringify(manifest))).then(function (m) {
             manifest.manifest_sha256 = m;
             var mb = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
-            return uploadAsset(token, owner, repo, releaseId, tag + ".backup.json", mb);
+            return uploadAsset(token, uploadUrl, tag + ".backup.json", mb);
           });
         }).then(function () {
           // Publish the draft now that every part is up.
@@ -238,6 +290,7 @@
           });
         }).then(function () { return { tag: tag, manifest: manifest }; });
       });
+    });
     });
   }
 
