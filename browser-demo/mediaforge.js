@@ -29,7 +29,7 @@
   var FORGE_BASES = ['http://127.0.0.1:8200']; // 127.0.0.1, never localhost
   // Hosted lane: the forge-gateway (RBAC + tenant scoping + burst deny) at
   // forge.aitherium.com. A page may still override with __AITHER_FORGE_HOSTED__.
-  var HOSTED = window.__AITHER_FORGE_HOSTED__ || 'https://forge.aitherium.com';
+  var HOSTED = window.__AITHER_FORGE_HOSTED__ || 'https://mediaforge.aitherium.com';
   var TOKEN_KEY = 'aitheros-gateway-token';
 
   function readToken() {
