@@ -902,29 +902,43 @@ gobbo.every(5, async () =&gt; {
 <script src="js/22-scheduler.js"></script>
 <script src="js/23-card-code.js"></script>
 <script src="js/24-boot.js"></script>
-<script src="aither-bonsai-adapter.js"></script>
 <script>
-/* The tag above can 404 without throwing. If it did, GobboNet would run on its DEFAULT
-   transport and every signal would look healthy — so say so, visibly, rather than let a
-   silent fallback masquerade as on-device inference. */
+/* The Bonsai adapter is a SHIPPED MOD (mod_js_bonsai_adapter in
+   DEFAULT_EXTENSIONS) loaded through the extensions path so the MODS panel
+   shows it and the user can toggle it - not a hard <script> tag here. A
+   missing extension can fail without throwing; if it did, GobboNet would run
+   on its DEFAULT transport and every signal would look healthy - so say so,
+   visibly, rather than let a silent fallback masquerade as on-device
+   inference. */
 (function () {
-  if (window.__aitherBonsaiAdapter) return;
-  console.error('[aither] Bonsai adapter did not install — this chat is NOT running on your GPU.');
   addEventListener('DOMContentLoaded', function () {
-    var b = document.createElement('div');
+    // The adapter is a dynamically-inserted extension script (applyExtensions
+    // runs AFTER loadState awaits IndexedDB), so it installs LATER than this
+    // event. Poll for a few seconds before declaring it missing - a single
+    // check at DOMContentLoaded would cry wolf on every boot.
+    var tries = 0;
+    var check = function () {
+      if (window.__aitherBonsaiAdapter) return;
+      if (tries++ < 20) { setTimeout(check, 250); return; }
+      console.error('[aither] Bonsai adapter did not install - this chat is NOT running on your GPU.');
+      showAdapterFailure();
+    };
+    setTimeout(check, 250);
+  });
+})();
+function showAdapterFailure() {
+  var b = document.createElement('div');
     b.setAttribute('role', 'alert');
-    b.textContent = '// ADAPTER FAILED TO LOAD \u2014 this chat is NOT running on your GPU';
+    b.textContent = '// ADAPTER FAILED TO LOAD - this chat is NOT running on your GPU';
     // GobboNet's OWN palette (css/: --red-neon #ff003c on --black #020205, mono). A generic
-    // red system-ui bar would read as someone else's error injected into their terminal —
+    // red system-ui bar would read as someone else's error injected into their terminal -
     // which is exactly what it would be. Speak the app's language when interrupting it.
     b.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;'
       + 'padding:10px 14px;text-align:center;letter-spacing:0.06em;'
       + "font:600 12px/1.5 'Atkinson Hyperlegible Mono',ui-monospace,Consolas,monospace;"
       + 'background:#020205;color:#ff003c;border-top:1px solid #ff003c';
     document.body.appendChild(b);
-  });
-})();
+}
 </script>
-<script src="gobbonet-backup.js"></script>
 </body>
 </html>
