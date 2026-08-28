@@ -734,9 +734,12 @@ function memoryAddFactFromInput(kind) {
 }
 
 /** Brief button flash on the action row so a pin/block visibly landed.
- *  Mirrors copyMessage's per-button flash — same dance, no dependency. */
+ *  Mirrors copyMessage's per-button flash — same dance, no dependency.
+ *  Indexes by the message row's data-index, NOT positionally: #messages
+ *  also holds system-inject banners (.message-system-inject), which would
+ *  shift a positional lookup onto the wrong row. */
 function _memoryFlashBtn(index, kind) {
-  const msgEl = document.querySelectorAll('#messages .message')[index];
+  const msgEl = document.querySelector(`#messages .message[data-index="${index}"]`);
   if (!msgEl) return;
   const btn = msgEl.querySelector('.msg-action-btn' + (kind === 'blocked' ? '.btn-block' : '.btn-pin'));
   if (!btn) return;

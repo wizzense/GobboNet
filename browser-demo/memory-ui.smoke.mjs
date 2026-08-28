@@ -131,6 +131,58 @@ persisted = await evalJs(
 if (!persisted) fail("pin removal not persisted");
 ok("pin removal persisted");
 
+console.log("[6] per-message Pin button (user turn)");
+await evalJs(`
+  (() => {
+    const th = getActiveThread();
+    th.messages.push({ role: 'user', content: 'The scroll is in the library.', timestamp: Date.now() });
+    th.messages.push({ role: 'assistant', content: 'The scroll is in the library.', timestamp: Date.now() });
+    renderMessages();
+    const btn = document.querySelector('#messages .message[data-index="0"] .btn-pin');
+    if (!btn) { throw new Error('no Pin button on user message row'); }
+    btn.click();
+    return true;
+  })()
+`);
+persisted = await evalJs(
+  "getActiveThread() && getThreadMemory(getActiveThread()).pinned.some(p => (p.text||'').indexOf('scroll') !== -1)");
+if (!persisted) fail("Pin button did not pin the message content");
+ok("Pin button added the message content to pinned");
+
+console.log("[7] per-message Block button (AI reply)");
+await evalJs(`
+  (() => {
+    const btn = document.querySelector('#messages .message[data-index="1"] .btn-block');
+    if (!btn) { throw new Error('no Block button on assistant message row'); }
+    btn.click();
+    return true;
+  })()
+`);
+persisted = await evalJs(
+  "getActiveThread() && getThreadMemory(getActiveThread()).blocked.some(b => (b.text||'').indexOf('scroll') !== -1)");
+if (!persisted) fail("Block button did not block the reply content");
+ok("Block button added the reply content to blocked");
+
+console.log("[8] flash targets the right row (banner-shift regression)");
+// Insert a system-inject banner into #messages BEFORE the message rows, then
+// flash index 0 (the user row — the one that carries a Pin button). A
+// positional helper would grab the banner first and silently no-op; the
+// data-index helper must find the real row and flash its Pin button.
+const flashOk = await evalJs(`
+  (() => {
+    const container = document.getElementById('messages');
+    const banner = document.createElement('div');
+    banner.className = 'message message-system-inject';
+    banner.textContent = 'banner';
+    container.insertBefore(banner, container.firstChild);
+    _memoryFlashBtn(0, 'pinned');
+    const row0 = document.querySelector('#messages .message[data-index="0"] .btn-pin');
+    return row0 && row0.textContent === 'pinned';
+  })()
+`);
+if (!flashOk) fail("flash landed on the wrong row after a banner shift");
+ok("flash hit data-index row, not the banner");
+
 console.log("\nUI SMOKE PASS — memory manager works end to end in the real page");
 ws.close();
 chrome.kill();
