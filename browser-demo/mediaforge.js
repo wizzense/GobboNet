@@ -27,9 +27,10 @@
   window.__AITHER_FORGE_MOD__ = { version: '1.0.0' };
 
   var FORGE_BASES = ['http://127.0.0.1:8200']; // 127.0.0.1, never localhost
-  // Hosted lane: the forge-gateway (RBAC + tenant scoping + burst deny) at
-  // forge.aitherium.com. A page may still override with __AITHER_FORGE_HOSTED__.
-  var HOSTED = window.__AITHER_FORGE_HOSTED__ || 'https://mediaforge.aitherium.com';
+  var HOSTED = window.__AITHER_FORGE_HOSTED__ || ''; // OFF by default: the docstring above promises the hosted forge stays off
+  // unless the page opts in. A literal fallback to an internal hostname would
+  // (a) ship an internal URL in the public fork and (b) contradict that
+  // promise. The truthy guard at line 55 makes '' a clean 'local forge only'.
   var TOKEN_KEY = 'aitheros-gateway-token';
 
   function readToken() {
@@ -44,10 +45,6 @@
   }
 
   function httpJson(url, opts) {
-    opts = opts || {};
-    // credentials: include so the aither_auth_token (Domain=.aitherium.com)
-    // rides along on the hosted lane; harmless on the localhost lane.
-    opts.credentials = opts.credentials || 'include';
     return fetch(url, opts).then(function (r) {
       return r.json().then(function (body) {
         if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));

@@ -306,6 +306,7 @@ Everything GobboNet can do, grouped so it's easy to scan.
 - Folders, tags, and pins — sort chats into folders, label them with tags, and pin your favorites to the top.
 - Branching conversations — fork a chat at any point to explore a different direction without losing the original.
 - Memory + summarization — older parts of a long chat are automatically summarized so the AI keeps remembering what matters.
+- **User memory overrides** — the summary is the AI's, but you own it. **Pin** a message and its content stays in the summary no matter what compression decides; **Block** a reply and its content is stripped out wherever it appears. Manage both lists (and see which pins the AI is currently carrying) in the **LORE SUMMARY** inspector — click the `LORE` chip in the header.
 - Drag-and-drop file attachments — drag a file straight into the chat to attach it.
 
 **Characters & personas**
