@@ -80,9 +80,6 @@ function forkAt(messageIndex) {
     name: `⑂ ${baseName}`,
     messages: sharedMessages,
     lore: thread.lore || '',
-    // Forks inherit the parent's user memory (pinned/blocked lists). The
-    // branch shares the same history, so the same overrides apply.
-    memory: JSON.parse(JSON.stringify(getThreadMemory(thread))),
     createdAt: Date.now(),
     pinned: false,
     folderId: thread.folderId,
@@ -177,10 +174,6 @@ function createThread() {
     // (card.startingLore) and is injected fresh each build, so we no longer
     // seed it here — that kept the two cleanly separated (see buildContextMessages).
     lore: '',
-    // User memory overrides — pinned facts (always in the summary) and
-    // blocked facts (never in the summary). Seeded empty; getThreadMemory
-    // also tolerates threads created before this field existed.
-    memory: { pinned: [], blocked: [] },
     createdAt: Date.now(),
     pinned: false,
     folderId: null,

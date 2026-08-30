@@ -91,9 +91,6 @@ const DEFAULT_SETTINGS = {
 // tags in chat.html; they now ride the extensions path so the panel shows
 // what is actually loaded. 05-persistence.js seeds them onto existing users
 // exactly once (stable ids — a user who removes one is never re-seeded).
-// The DEMO (browser-demo/, published at the Pages site root) ships the
-// adapter, the image gallery and media forge exactly like the root app, plus
-// the backup mod, which this tree carries and the root app leaves opt-in.
 const DEFAULT_EXTENSIONS = {
   enabled: true,
   styles: [
@@ -102,8 +99,7 @@ const DEFAULT_EXTENSIONS = {
   scripts: [
     { id: 'mod_js_bonsai_adapter', name: 'Aither Bonsai Adapter (shipped mod)', url: 'aither-bonsai-adapter.js', raw: '' },
     { id: 'mod_js_image_renderer', name: 'Image Renderer (shipped mod)', url: 'image-renderer.js', raw: '' },
-    { id: 'mod_js_mediaforge', name: 'Media Forge (awforge mod)', url: 'mediaforge.js', raw: '' },
-    { id: 'mod_js_gobbonet_backup', name: 'GobboNet Backup (shipped mod)', url: 'gobbonet-backup.js', raw: '' }
+    { id: 'mod_js_mediaforge', name: 'Media Forge (awforge mod)', url: 'mediaforge.js', raw: '' }
   ]
 };
 
@@ -210,14 +206,14 @@ let state = {
   folders: [],
   extensions: { ...DEFAULT_EXTENSIONS },
   macros: DEFAULT_MACROS.map(m => ({ ...m })),
-  // Tracks which DEFAULT_MACROS triggers have already been seeded onto
-  // this user's state. Lets us add new default macros in future versions
-  // without re-adding ones the user intentionally deleted. See loadState.
   // Tracks which shipped-mod extension ids have already been seeded onto
   // this user's state. Same contract as seededDefaultMacros: each default
   // mod is seeded at most once per user, so deleting one in the panel
   // sticks across reloads.
   seededDefaultExtensions: [],
+  // Tracks which DEFAULT_MACROS triggers have already been seeded onto
+  // this user's state. Lets us add new default macros in future versions
+  // without re-adding ones the user intentionally deleted. See loadState.
   seededDefaultMacros: DEFAULT_MACROS.map(m => m.trigger)
 };
 

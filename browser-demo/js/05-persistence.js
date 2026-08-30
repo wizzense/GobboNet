@@ -161,49 +161,6 @@ function applyLoadedState(saved) {
       state.extensions = migrateExtensions(saved.extensions);
       state.macros = Array.isArray(saved.macros) ? saved.macros : DEFAULT_MACROS.map(m => ({ ...m }));
 
-      // Seed the shipped mods (DEFAULT_EXTENSIONS) onto existing users
-      // exactly once. The comment on DEFAULT_EXTENSIONS promised this loop;
-      // it did not exist, so a user whose save predates the mods loaded an
-      // EMPTY extensions list here and the MODS panel showed nothing while
-      // the chat.html hard-tags the same mods had been removed. Same
-      // contract as the macro seeding below: each default mod is seeded at
-      // most once, so a user who deletes one in the panel does NOT get it
-      // re-added on the next load.
-      if (Array.isArray(saved.seededDefaultExtensions)) {
-        state.seededDefaultExtensions = [...saved.seededDefaultExtensions];
-      } else {
-        // Pre-tracking user: NOTHING has ever been seeded. Deliberately
-        // different from the macro backfill below — macros shipped in the
-        // defaults list before tracking existed, so "already seen" is a safe
-        // assumption there; the mods shipped as HARD TAGS in chat.html, never
-        // as extensions, so a pre-tracking user has never had them to delete.
-        // Seeding everything now is what makes the MODS panel show what is
-        // actually loaded instead of an empty list.
-        state.seededDefaultExtensions = [];
-        // Their `enabled: false` is the LEGACY default (extensions shipped
-        // off, hard-tagged mods), not a deliberate off — the shipped
-        // DEFAULT_EXTENSIONS is enabled:true and fresh users get them ON.
-        // Turn the pre-tracking user on too, or seeding lists mods that
-        // applyExtensions refuses to load — the exact empty-panel complaint
-        // this loop exists to fix. A POST-tracking save's flag is respected
-        // (it is a real choice made with the mods visible).
-        state.extensions.enabled = true;
-      }
-      const _seedExtList = (kind) => {
-        const defaults = (DEFAULT_EXTENSIONS[kind] || []);
-        const list = state.extensions[kind] || (state.extensions[kind] = []);
-        for (const def of defaults) {
-          if (!def || !def.id) continue;
-          if (state.seededDefaultExtensions.includes(def.id)) continue;
-          // Don't clobber a user who already added this id themselves.
-          const exists = list.some(e => e && e.id === def.id);
-          if (!exists) list.push({ ...def });
-          state.seededDefaultExtensions.push(def.id);
-        }
-      };
-      _seedExtList('styles');
-      _seedExtList('scripts');
-
       // Seed any new DEFAULT_MACROS the user hasn't seen yet.
       //
       // The contract: each default macro is seeded at most once per user.
@@ -532,8 +489,7 @@ function buildStateBlob() {
     folders: state.folders,
     extensions: state.extensions,
     macros: state.macros,
-    seededDefaultMacros: state.seededDefaultMacros,
-    seededDefaultExtensions: state.seededDefaultExtensions
+    seededDefaultMacros: state.seededDefaultMacros
   };
 }
 

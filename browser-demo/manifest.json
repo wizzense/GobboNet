@@ -20,6 +20,8 @@
     "css/15-lore-view.css",
     "default-characters.json",
     "gobbonet.ico",
+    "image-renderer.css",
+    "image-renderer.js",
     "js/01-config.js",
     "js/02-model.js",
     "js/03-generation.js",
@@ -43,6 +45,7 @@
     "js/21-data.js",
     "js/22-scheduler.js",
     "js/23-card-code.js",
-    "js/24-boot.js"
+    "js/24-boot.js",
+    "mediaforge.js"
   ]
 }
