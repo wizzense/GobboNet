@@ -339,7 +339,7 @@
     // On a phone the GPU is never used (gpuLaneAllowed): a size is runnable here only if
     // its converted CPU weights exist, which today is the 1.7B alone.
     if (cat && wasmRunnable(id)) return null;
-    return (cat ? cat.label : id) + ' (' + (cat && cat.sizeMb ? cat.sizeMb + ' MB' : 'size unknown') + ') has no CPU build for this phone, and the phone GPU '
+    return (cat ? cat.label : id) + ' has no CPU build for this phone, and the phone GPU '
       + 'is never used in this tab -- loading it there ends the tab rather than reporting '
       + 'an error. Pick the 1.7B (runs on the CPU here), or run it on this phone '
       + 'properly with a Linux terminal (Termux or the Android Linux Terminal):\n\n'

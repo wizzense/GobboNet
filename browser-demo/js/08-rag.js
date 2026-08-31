@@ -701,8 +701,19 @@ async function buildContextMessages(thread, card, opts) {
   let summary = getThreadLore(thread);
   const summaryTokens = (summary && card.loreEnabled) ? estimateTokens(summary) + 4 : 0;
 
+  // User memory overrides (pinned/blocked). The PINNED side rides in EVERY
+  // build as its own system block (position 3.5 below), so a fact the user
+  // pinned is present from the very first turn — not only once compression
+  // has started. Count its tokens as fixed overhead so the compression
+  // trigger and the trim safety net know about it. Gated on loreEnabled
+  // like the summary itself: no compression, no summary, no memory block.
+  const _memory = getThreadMemory(thread);
+  const memoryPinnedText = (_memory.pinned || []).map(x => (typeof x === 'string') ? x : x.text).filter(Boolean);
+  const memoryPinnedTokens = (card.loreEnabled && memoryPinnedText.length)
+    ? estimateTokens(memoryPinnedText.join('\n')) + 4 : 0;
+
   let usedTokens = writingStyleTokens + personalityTokens + authoredLoreTokens
-                 + personaTokens + summaryTokens;
+                 + personaTokens + summaryTokens + memoryPinnedTokens;
 
   // Live (non-archived) messages — what we'd send if no compression
   // happened this turn. Pre-compute per-message token costs so we can
@@ -727,7 +738,7 @@ async function buildContextMessages(thread, card, opts) {
     // grow, so we don't immediately bounce back over the line.
     const summaryReserve = Math.max(summaryTokens, 1024);
     const targetTotal    = Math.floor(budget * TARGET_FACTOR);
-    const fixedOverhead  = writingStyleTokens + personalityTokens + authoredLoreTokens + personaTokens;
+    const fixedOverhead  = writingStyleTokens + personalityTokens + authoredLoreTokens + personaTokens + memoryPinnedTokens;
     const targetLive     = Math.max(0, targetTotal - fixedOverhead - summaryReserve);
     const tokensToFree   = Math.max(0, liveTokens - targetLive);
 
@@ -759,8 +770,10 @@ async function buildContextMessages(thread, card, opts) {
 
     if (toArchive.length > 0) {
       // Fold the just-archived chunk into the running summary (with any prior).
+      // The thread is passed so user memory overrides (pinned/blocked) are
+      // enforced inside the pass — see summarizeForLore.
       const _loreBefore = summary || '';
-      summary = await summarizeForLore(summary, toArchive);
+      summary = await summarizeForLore(summary, toArchive, thread);
       setThreadLore(thread, summary);
 
       // Record what this pass actually did. Without a before/after size you
@@ -801,7 +814,7 @@ async function buildContextMessages(thread, card, opts) {
       // caller as tokensUsed so the status bar shows reality.
       liveMsgs = thread.messages.filter(m => !m.archived);
       usedTokens = writingStyleTokens + personalityTokens + authoredLoreTokens + personaTokens
-                 + (summary ? estimateTokens(summary) + 4 : 0);
+                 + (summary ? estimateTokens(summary) + 4 : 0) + memoryPinnedTokens;
       saveState();
       renderMessages();   // surface the dimming + lore divider immediately
     }
@@ -844,8 +857,22 @@ async function buildContextMessages(thread, card, opts) {
 
   // ---- 3. AUTO-SUMMARY (running summary of older, archived turns) ----
   if (summary && card.loreEnabled) {
+    // Scrub blocked facts at INJECTION time too, not only inside
+    // summarizeForLore: a fact can be blocked after the summary was last
+    // written, and the stored text must not keep feeding it to the model.
+    const scrubbed = scrubBlockedFacts(summary, _memory);
     apiMessages.push({ role: 'system',
-      content: '[Story so far \u2014 summary of earlier messages]\n' + translateTemplates(summary, charName, userName) });
+      content: '[Story so far \u2014 summary of earlier messages]\n' + translateTemplates(scrubbed, charName, userName) });
+  }
+
+  // ---- 3.5 USER MEMORY (pinned facts) \u2014 present EVERY build, so a pin
+  // survives even before the first compression fires. The AI forgets what
+  // it never sees; this block is the user's guarantee that what they
+  // pinned is always seen. Blocked facts are deliberately NOT here \u2014 they
+  // are removals, and they apply to the summary (scrubbed above).
+  if (memoryPinnedText.length && card.loreEnabled) {
+    apiMessages.push({ role: 'system',
+      content: '[User memory \u2014 pinned, always included]\n' + translateTemplates(memoryPinnedText.join('\n'), charName, userName) });
   }
 
   // ---- RAG retrieval (Stage 1) ----
