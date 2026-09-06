@@ -363,58 +363,6 @@ Everything GobboNet can do, grouped so it's easy to scan.
 
 ---
 
-## Make it agentic: Aither / awdk / awsh / AWNIX
-
-This fork is the front door of **Aitherium** — the agent platform this demo
-was built to showcase. The same chat you run here plugs into a local agent
-stack in three commands, and the full workspace is one URL away:
-
-**The full Aither workspace** — [gobbonet.aitherium.com](https://gobbonet.aitherium.com)
-is the unified hub: on-device chat, company rooms, your local daemon's
-sessions and decision cards, status, AitherOS Online, AitherDesktop and the
-AWNIX sandbox — all in one shell. Everything on this page (chat, adapter,
-mods) is the classic vanilla surface; the hub is where the stack lives.
-
-1. **awdk — the local agent daemon**
-
-   ```bash
-   pip install awdk
-   adk up
-   ```
-
-   `adk up` starts the adk daemon on `127.0.0.1:8362`. The hub detects it and
-   its **Sessions**, **Decisions** and **Workspace** rooms hook straight in —
-   the same workspace portal.aitherium.com gives you, on your own machine.
-
-2. **awsh — the shell that answers**
-
-   ```bash
-   npm i -g @aitherium/shell-cli
-   awsh
-   ```
-
-   A terminal where a line you don't recognise is a question, not an error.
-
-3. **AWNIX — a Linux you can hand to an agent**
-
-   ```bash
-   git clone https://github.com/Aitherium/awnix
-   cd awnix && podman build -t awnix:latest -f Containerfile .
-   ```
-
-   A bootable, immutable Linux base — rootless podman, bootc atomic updates
-   with rollback, leases and verified artifacts in the base. ISO assembly and
-   NVIDIA variants are in the repo's `.DEPLOYMENT/standalone/bootc/`.
-
-4. **The org** — every piece lives at [github.com/Aitherium](https://github.com/Aitherium)
-   (awdk, awsh, awnix, awnode, and more bricks), with docs at
-   [awknowledge.aitherium.com](https://awknowledge.aitherium.com).
-
-A node joining the mesh (awnode) is enrolled per-tenant with a short-lived
-token — the join command comes from your workspace, not a public one-liner.
-
----
-
 ## Mods (optional) — showing pictures in the chat
 
 GobboNet can load small add-ons. Settings has an **Extensions** panel where you paste
