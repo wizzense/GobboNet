@@ -1,0 +1,25 @@
+# What upstream release this vendored tree corresponds to, and whether we know it is
+# behind. Read by AitherOS/dev/tools/check_vendored_upstream_current.py.
+#
+# This file exists because the absence of it cost real work on 2026-08-24: an agent read
+# this tree, correctly concluded "GobboNet's whole setup layer is Windows-only", and told
+# a Fedora user there was no Linux version. Upstream v1.6 had shipped a Go .deb three days
+# earlier. The tree was not wrong -- it was OLD, and nothing said so, so "old" and
+# "complete" were indistinguishable to every reader.
+repo: ElodineOfficial/GobboNet
+
+# The release this snapshot corresponds to. `unknown` is honest here: the tree carries no
+# version marker. What IS verifiable is the boundary -- it predates the Go launcher
+# (grep finds no `usr/lib/gobbonet`, `gobbonet-launch` or `go.mod`), which arrived in v1.6.
+vendored_release: unknown
+evidence: "pre-Go web-app tree: launch.bat + fileserver.ps1 + hardware-probe.ps1, no go.mod"
+
+# The newest upstream release we have LOOKED AT and decided not to re-vendor.
+# When upstream publishes something newer than this, the check goes red -- on purpose.
+# That is the whole mechanism: drift becomes a decision instead of a silence.
+acknowledged_behind: "v1.6"
+reason: >
+  Deliberate. We vendor this tree to READ (the adapter, the mods and the consent work all
+  cite js/ line numbers), not to run. Re-vendoring churns those citations. v1.6 moved the
+  LAUNCHER to Go; the browser client this repo actually integrates with is unchanged, so
+  the read-value is intact. Re-vendor when a js/ change breaks a cited line, not on a tag.
