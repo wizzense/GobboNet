@@ -17,9 +17,16 @@ evidence: "pre-Go web-app tree: launch.bat + fileserver.ps1 + hardware-probe.ps1
 # The newest upstream release we have LOOKED AT and decided not to re-vendor.
 # When upstream publishes something newer than this, the check goes red -- on purpose.
 # That is the whole mechanism: drift becomes a decision instead of a silence.
-acknowledged_behind: "v1.6"
+acknowledged_behind: "v1.7.6"
 reason: >
-  Deliberate. We vendor this tree to READ (the adapter, the mods and the consent work all
-  cite js/ line numbers), not to run. Re-vendoring churns those citations. v1.6 moved the
-  LAUNCHER to Go; the browser client this repo actually integrates with is unchanged, so
-  the read-value is intact. Re-vendor when a js/ change breaks a cited line, not on a tag.
+  Deliberate, re-decided 2026-09-25 after reading the release notes for 1.7, v1.7.2,
+  v1.7.3 and v1.7.6. We vendor this tree to READ (the adapter, the mods and the consent
+  work all cite js/ line numbers), not to run; re-vendoring churns those citations.
+  Unlike v1.6, the 1.7.x line DOES change the browser client: sticky/reorderable cards,
+  a streaming toggle, per-thread and per-character export, device-sync of conversations,
+  optional encrypted server-side history, a config toml, and idle stand-down of the
+  backend. None of that is in this tree, so do NOT read upstream/ as a description of
+  what current GobboNet does -- read the upstream repo for that. v1.7.3 adds a Fedora
+  RPM beside the Windows installer and the Debian .deb (the setup layer is cross-platform).
+  Re-vendor when a js/ change breaks a cited line or when an integration needs a 1.7.x
+  client feature, not on a tag.
