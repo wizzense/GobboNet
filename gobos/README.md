@@ -12,7 +12,7 @@ change the brand, and produce your own bootable appliance.
 | layer | what it is | you |
 |---|---|---|
 | `centos-bootc:stream9` | the kernel/OS upstream | keep |
-| awnix base (`Containerfile.awnix`) | the public OS layer — 12 aw* tools, immutable, Apache-2.0 | keep |
+| awnix base (`Containerfile.awnix`) | the public OS layer — 12 aw* tools, immutable, Apache-2.0 AND BUSL-1.1 (awdk, awsh) | keep |
 | **this dir (`gobos/`)** | the brand + the GobboNet brain | **this is the fork point** |
 
 The whole "CentOS" story is one file: `Containerfile.gobos`'s brand block.

@@ -14,7 +14,8 @@
 #
 # Build (inside the monorepo, next to .DEPLOYMENT/standalone/bootc/):
 #   podman build -t gobos:latest -f .PRODUCTS/.GOBBONET/upstream/gobos/Containerfile.gobos .
-# Licence: Apache-2.0 (same as the awnix base and every aw* package inside it)
+# Licence: these build files are Apache-2.0. The awnix base also carries awdk and awsh
+# (BUSL-1.1), so a built image is "Apache-2.0 AND BUSL-1.1" like the base (#10893).
 # ═══════════════════════════════════════════════════════════════════════════════
 FROM awnix-base:latest
 
