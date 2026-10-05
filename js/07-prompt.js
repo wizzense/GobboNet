@@ -267,6 +267,112 @@ function setThreadLore(thread, lore) {
   if (thread) thread.lore = lore;
 }
 
+/* ================================================================
+   USER MEMORY OVERRIDES (pinned + blocked)
+
+   The AI writes the summary; the user owns it. Two lists, both
+   user-authored, both enforced STRUCTURALLY after every compression
+   pass rather than merely requested from the model:
+
+     pinned  — facts the user says must ALWAYS be in the summary.
+               The summariser prompt asks for them, and then
+               assertPinnedFacts() re-checks the OUTPUT and appends
+               any that are missing. A prompt is a request; this is
+               a guarantee.
+     blocked — things the AI added that the user does not want.
+               scrubBlockedFacts() removes any summary line that
+               mentions one. The summary is the one artifact the
+               model rewrites wholesale on every pass, so a wrongly
+               added detail otherwise survives forever — every
+               rewrite re-reads it and keeps it.
+
+   Both lists live on the thread (thread.memory) so they persist
+   with the conversation and ride along on forks.
+================================================================ */
+function getThreadMemory(thread) {
+  if (!thread || !thread.memory) return { pinned: [], blocked: [] };
+  return thread.memory;
+}
+
+function setThreadMemory(thread, memory) {
+  if (thread) thread.memory = memory;
+}
+
+/** Normalise a fact for matching: trim, lowercase, collapse whitespace.
+ *  Matching is deliberately loose — the summary is AI-rewritten every
+ *  pass, so a byte-exact match would almost never fire. */
+function _memoryNorm(text) {
+  return String(text || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/** Structural guarantee for pinned facts. Returns the summary with every
+ *  pinned fact the AI dropped re-appended as its own MEMORY: line.
+ *  A pinned fact already present (fuzzy match) is NOT duplicated. */
+function assertPinnedFacts(summary, memory) {
+  const pinned = (memory && Array.isArray(memory.pinned)) ? memory.pinned : [];
+  if (!pinned.length || !summary) return summary;
+  const norm = _memoryNorm(summary);
+  const missing = [];
+  for (const p of pinned) {
+    const text = (typeof p === 'string') ? p : (p && p.text) || '';
+    const t = _memoryNorm(text);
+    if (t && norm.indexOf(t) === -1) missing.push(text.trim());
+  }
+  if (!missing.length) return summary;
+  const extra = missing.map(t => 'MEMORY: ' + t).join('\n');
+  return summary.replace(/\s*$/, '') + '\n' + extra;
+}
+
+/** Structural scrub for blocked facts. Removes any summary LINE that
+ *  mentions a blocked fact (fuzzy). Lines are the unit so a blocked
+ *  detail disappears without shredding the rest of a field. */
+function scrubBlockedFacts(summary, memory) {
+  const blocked = (memory && Array.isArray(memory.blocked)) ? memory.blocked : [];
+  if (!blocked.length || !summary) return summary;
+  const terms = [];
+  for (const b of blocked) {
+    const text = (typeof b === 'string') ? b : (b && b.text) || '';
+    const t = _memoryNorm(text);
+    if (t) terms.push(t);
+  }
+  if (!terms.length) return summary;
+  const kept = [];
+  for (const line of summary.split('\n')) {
+    const nl = _memoryNorm(line);
+    if (terms.some(t => nl.indexOf(t) !== -1)) continue;
+    kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/** Add a fact to a memory list (dedupes, caps length). Returns true if added. */
+function addMemoryFact(thread, kind, text) {
+  if (!thread) return false;
+  const t = String(text || '').trim();
+  if (!t) return false;
+  const memory = getThreadMemory(thread);
+  const list = (kind === 'blocked') ? memory.blocked : memory.pinned;
+  if (!Array.isArray(list)) return false;
+  // Cap: a fact longer than this is a document, not a memory. The summary
+  // budget is precious and a runaway pin defeats the compression it rides on.
+  const MAX_FACT = 400;
+  const capped = t.length > MAX_FACT ? t.slice(0, MAX_FACT) + '…' : t;
+  const norm = _memoryNorm(capped);
+  if (list.some(x => _memoryNorm((typeof x === 'string') ? x : x.text) === norm)) return false;
+  list.push({ text: capped, ts: Date.now() });
+  setThreadMemory(thread, memory);
+  return true;
+}
+
+function removeMemoryFact(thread, kind, index) {
+  if (!thread) return;
+  const memory = getThreadMemory(thread);
+  const list = (kind === 'blocked') ? memory.blocked : memory.pinned;
+  if (!Array.isArray(list) || index < 0 || index >= list.length) return;
+  list.splice(index, 1);
+  setThreadMemory(thread, memory);
+}
+
 /* Maximum chars we'll retain in lore. Beyond this we trim from the front
    on a sentence boundary so the most recent context is preserved. */
 // Backstop only — the prompt targets ~180 words (roughly 1,100 chars), so
@@ -286,8 +392,11 @@ const LORE_MAX_CHARS = 2400;
    so each one now records why. Read it in the lore inspector. */
 let _loreLastOutcome = null;
 
-async function summarizeForLore(existingLore, messagesToSummarize) {
+async function summarizeForLore(existingLore, messagesToSummarize, thread) {
   _loreLastOutcome = null;
+  const memory = getThreadMemory(thread);
+  const _pinnedFacts = (memory.pinned || []).map(x => (typeof x === 'string') ? x : x.text).filter(Boolean);
+  const _blockedFacts = (memory.blocked || []).map(x => (typeof x === 'string') ? x : x.text).filter(Boolean);
   // Instructions go in a SYSTEM message, not the user turn — most modern
   // chat templates weight system content more reliably for format
   // compliance. We also do NOT include m.reasoning: chain-of-thought from
@@ -307,7 +416,7 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
   // model treated the existing summary as immutable and bolted a new
   // sentence on the end. Nothing ever authorised it to delete, merge or
   // shorten what was already there, so the summary could only accrete.
-  const sys = 'You maintain a running summary of a long conversation. You will be '
+  let sys = 'You maintain a running summary of a long conversation. You will be '
     + 'given the current summary and the new messages since it was written. '
     + 'Rewrite the summary so it covers all of it.\n\n'
     + 'RULES:\n'
@@ -322,12 +431,24 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
     + 'small talk, scene-setting prose and anything already resolved.\n'
     + '4. Under 180 words total. Shorter is better.\n'
     + '5. No preamble, no chain-of-thought, no bullet characters, no commentary. '
-    + 'Output the fields and nothing else.\n\n'
+    + 'Output the fields and nothing else.\n'
+    + '6. USER-PINNED facts (listed below) must appear in the summary - include each '
+    + 'one even if it seems minor, settled, or redundant. They are there because the '
+    + 'user said they matter.\n'
+    + '7. USER-BLOCKED facts (listed below) must never appear in the summary or be '
+    + 'mentioned in any field, even if they are true or were said earlier.\n\n'
     + 'Output these fields, one per line, omitting any that do not apply:\n'
     + 'SETTING: where things stand, plus world facts that persist.\n'
     + 'CHARACTERS: who is present or matters, one short clause each.\n'
     + 'OPEN: unresolved threads - injuries, inventory, debts, promises, pending decisions.\n'
     + 'EVENTS: what happened, oldest to newest, essentials only.';
+
+  if (_pinnedFacts.length) {
+    sys += '\n\nUSER-PINNED FACTS (must be included):\n' + _pinnedFacts.join('\n');
+  }
+  if (_blockedFacts.length) {
+    sys += '\n\nUSER-BLOCKED FACTS (must never appear):\n' + _blockedFacts.join('\n');
+  }
 
   let body = '';
   if (existingLore) {
@@ -496,6 +617,13 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
       const cut = head.lastIndexOf('\n');
       summary = (cut > 200 ? head.slice(0, cut) : head).trim();
     }
+
+    // STRUCTURAL memory enforcement. The prompt asks; this guarantees.
+    // Order matters: scrub blocked first, THEN re-assert pinned, so a
+    // fact the user pinned while also blocking (a contradiction) lands on
+    // the pin side — an explicit keep beats an explicit drop.
+    summary = scrubBlockedFacts(summary, memory);
+    summary = assertPinnedFacts(summary, memory);
     return summary;
   } catch (e) {
     _loreLastOutcome = 'threw: ' + (e && e.message ? e.message : String(e));

@@ -210,14 +210,14 @@ let state = {
   folders: [],
   extensions: { ...DEFAULT_EXTENSIONS },
   macros: DEFAULT_MACROS.map(m => ({ ...m })),
-  // Tracks which DEFAULT_MACROS triggers have already been seeded onto
-  // this user's state. Lets us add new default macros in future versions
-  // without re-adding ones the user intentionally deleted. See loadState.
   // Tracks which shipped-mod extension ids have already been seeded onto
   // this user's state. Same contract as seededDefaultMacros: each default
   // mod is seeded at most once per user, so deleting one in the panel
   // sticks across reloads.
   seededDefaultExtensions: [],
+  // Tracks which DEFAULT_MACROS triggers have already been seeded onto
+  // this user's state. Lets us add new default macros in future versions
+  // without re-adding ones the user intentionally deleted. See loadState.
   seededDefaultMacros: DEFAULT_MACROS.map(m => m.trigger)
 };
 

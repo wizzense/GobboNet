@@ -21,7 +21,9 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import vm from "node:vm";
 
-const dir = path.dirname(fileURLToPath(import.meta.url));
+// GOBBONET_TREE points the test at another web tree (e.g. the top-level
+// upstream/ tree the demo is generated from); default is this directory.
+const dir = process.env.GOBBONET_TREE || path.dirname(fileURLToPath(import.meta.url));
 const promptSrc = readFileSync(path.join(dir, "js", "07-prompt.js"), "utf-8");
 
 // --- minimal browser-ish globals 07-prompt.js touches at load -----------

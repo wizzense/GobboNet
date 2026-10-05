@@ -67,12 +67,23 @@ async function evalJs(expr) {
 await send("Page.enable");
 await send("Runtime.enable");
 await send("Page.navigate", { url: URL });
-for (let i = 0; i < 40; i++) { // wait for the app boot (IndexedDB, state)
+// Wait for the BOOT, not just the scripts: boot() awaits loadState() and then
+// sets state.activeThreadId = null, so a thread created before that lands is
+// silently un-selected and every later getActiveThread() is null; and a check
+// that only sees createThread defined can run before later scripts (e.g.
+// injectGreeting) exist. Waiting only for the two functions made this smoke
+// fail ~1 run in 4 (measured 2026-10-04 on the unchanged demo). _appBooted
+// flips after the boot tail, which runs after every script has loaded.
+let booted = false;
+// 60 s: the boot tail awaits the /state/info check, which has no timeout of its
+// own; on a loaded host a 15 s budget failed ~1 run in 4 with the page healthy.
+for (let i = 0; i < 240 && !booted; i++) {
   await sleep(250);
-  const ready = await evalJs("typeof createThread === 'function' && typeof openLoreInspector === 'function'");
-  if (ready) break;
+  booted = await evalJs("typeof createThread === 'function' && typeof openLoreInspector === 'function'"
+    + " && typeof _appBooted !== 'undefined' && _appBooted === true");
 }
-ok("app booted (createThread + openLoreInspector defined)");
+if (!booted) fail("app did not finish booting (_appBooted never set)");
+ok("app booted (boot tail finished; createThread + openLoreInspector defined)");
 
 console.log("[1] create a thread and open the lore inspector");
 await evalJs("createThread(); openLoreInspector(); true");

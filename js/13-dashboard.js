@@ -250,7 +250,8 @@ function renderMessages() {
           <button class="msg-action-btn btn-branch" onclick="forkAt(${i})" title="Branch conversation from here">⑂ Branch</button>
           <button class="msg-action-btn btn-edit" onclick="editMessage(${i})" title="Edit">Edit</button>
           <button class="msg-action-btn btn-delete" onclick="deleteMessage(${i})" title="Delete">Del</button>
-          <button class="msg-action-btn" onclick="copyMessage(${i})" title="Copy">Copy</button>`;
+          <button class="msg-action-btn" onclick="copyMessage(${i})" title="Copy">Copy</button>
+          <button class="msg-action-btn btn-pin" onclick="pinMessageToMemory(${i})" title="Pin to memory — this message's content is kept in the summary no matter what compression decides">Pin</button>`;
 
         // Edit-variant navigator: shown on any user message that has been
         // edited at least once (variants.length > 1 because the first edit
@@ -276,7 +277,8 @@ function renderMessages() {
           <button class="msg-action-btn btn-branch" onclick="forkAt(${i})" title="Branch from this reply — start a new thread that keeps this reply as its last AI turn, then pick up fresh">⑂ Branch</button>
           <button class="msg-action-btn btn-edit" onclick="editMessage(${i})" title="Edit">Edit</button>
           <button class="msg-action-btn" onclick="copyMessage(${i})" title="Copy">Copy</button>
-          <button class="msg-action-btn btn-delete" onclick="deleteMessage(${i})" title="Delete">Del</button>`;
+          <button class="msg-action-btn btn-delete" onclick="deleteMessage(${i})" title="Delete">Del</button>
+          <button class="msg-action-btn btn-block" onclick="blockMessageToMemory(${i})" title="Block from memory — this reply's content is stripped out of the summary wherever it appears">Block</button>`;
 
         // Reroll-variant navigator: shown on any AI message that has
         // more than one variant. Lets the user flip back to an earlier
@@ -607,6 +609,72 @@ function openLoreInspector() {
           + 'browser console logs the reason under [lore].</div>';
   }
 
+  // --- user memory overrides (pinned + blocked) ------------------------
+  // The summary is the AI's; this section is the user's. Pinned facts are
+  // re-asserted into the summary after every compression pass (structural,
+  // not just prompted), and blocked facts are stripped out of it.
+  // The "in summary?" marker is the diagnostic the customer asked for:
+  // it shows whether the AI currently carries each pinned fact, so a
+  // dropped pin is visible instead of silently forgotten.
+  const memory = getThreadMemory(thread);
+  const memPinned  = Array.isArray(memory.pinned)  ? memory.pinned  : [];
+  const memBlocked = Array.isArray(memory.blocked) ? memory.blocked : [];
+  const loreNorm = _memoryNorm(lore);
+
+  html += '<div class="lore-section-label">User memory</div>';
+
+  // Pinned list
+  html += '<div class="lore-memory-col">'
+        + '<div class="lore-memory-label">Pinned <span class="lore-memory-hint">'
+        + 'always kept in the summary, even if compression drops them</span></div>';
+  if (memPinned.length) {
+    html += '<div class="lore-memory-list">';
+    memPinned.forEach((p, i) => {
+      const txt = (typeof p === 'string') ? p : (p && p.text) || '';
+      const present = loreNorm && _memoryNorm(txt) && loreNorm.indexOf(_memoryNorm(txt)) !== -1;
+      const badge = present
+        ? '<span class="lore-memory-ok" title="This fact is present in the current summary">in summary</span>'
+        : '<span class="lore-memory-missing" title="The AI is not currently carrying this fact \u2014 it is re-added on the next compression pass">not in summary</span>';
+      html += '<div class="lore-memory-item">'
+            + badge + ' <span class="lore-memory-text">' + escapeHtml(txt) + '</span>'
+            + ' <button class="lore-memory-del" onclick="removeMemoryFact(getActiveThread(), \'pinned\', ' + i + '); saveState(); openLoreInspector();" title="Remove this pin">\u2715</button>'
+            + '</div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="lore-empty">Nothing pinned. Pin a message (Pin button on a user turn) '
+          + 'or add a fact below to keep it in the summary.</div>';
+  }
+  html += '<div class="lore-memory-add">'
+        + '<input id="lore-memory-pin-input" type="text" placeholder="Fact to always keep in the summary..." '
+        + 'onkeydown="if(event.key===\'Enter\'){memoryAddFactFromInput(\'pinned\')}">'
+        + '<button class="btn" onclick="memoryAddFactFromInput(\'pinned\')">Add pin</button>'
+        + '</div></div>';
+
+  // Blocked list
+  html += '<div class="lore-memory-col">'
+        + '<div class="lore-memory-label">Blocked <span class="lore-memory-hint">'
+        + 'stripped out of the summary wherever they appear</span></div>';
+  if (memBlocked.length) {
+    html += '<div class="lore-memory-list">';
+    memBlocked.forEach((b, i) => {
+      const txt = (typeof b === 'string') ? b : (b && b.text) || '';
+      html += '<div class="lore-memory-item">'
+            + '<span class="lore-memory-text">' + escapeHtml(txt) + '</span>'
+            + ' <button class="lore-memory-del" onclick="removeMemoryFact(getActiveThread(), \'blocked\', ' + i + '); saveState(); openLoreInspector();" title="Remove this block">\u2715</button>'
+            + '</div>';
+    });
+    html += '</div>';
+  } else {
+    html += '<div class="lore-empty">Nothing blocked. Block a reply (Block button on an AI turn) '
+          + 'or add a fact below to strip it from the summary.</div>';
+  }
+  html += '<div class="lore-memory-add">'
+        + '<input id="lore-memory-block-input" type="text" placeholder="Fact to strip out of the summary..." '
+        + 'onkeydown="if(event.key===\'Enter\'){memoryAddFactFromInput(\'blocked\')}">'
+        + '<button class="btn" onclick="memoryAddFactFromInput(\'blocked\')">Add block</button>'
+        + '</div></div>';
+
   body.innerHTML = html;
   document.getElementById('lore-inspect-modal').classList.add('open');
 }
@@ -614,6 +682,70 @@ function openLoreInspector() {
 function closeLoreInspector() {
   const m = document.getElementById('lore-inspect-modal');
   if (m) m.classList.remove('open');
+}
+
+/* ================================================================
+   USER MEMORY ACTIONS (pinned + blocked overrides)
+
+   The three operations the customer asked for, each structural:
+     - pinMessageToMemory / blockMessageToMemory: one-click from the
+       message action row — "this stays in the summary" / "this never
+       does". Pins are capped and deduped by addMemoryFact.
+     - memoryAddFactFromInput: free-text add from the inspector.
+   All three save state and re-render so the effect is immediate and
+   visible, including the "in summary?" badge on pins.
+================================================================ */
+
+function pinMessageToMemory(index) {
+  const thread = getActiveThread();
+  if (!thread) return;
+  const m = thread.messages[index];
+  if (!m || !m.content) return;
+  if (addMemoryFact(thread, 'pinned', m.content)) {
+    saveState();
+    _memoryFlashBtn(index, 'pinned');
+  }
+}
+
+function blockMessageToMemory(index) {
+  const thread = getActiveThread();
+  if (!thread) return;
+  const m = thread.messages[index];
+  if (!m || !m.content) return;
+  if (addMemoryFact(thread, 'blocked', m.content)) {
+    saveState();
+    _memoryFlashBtn(index, 'blocked');
+  }
+}
+
+function memoryAddFactFromInput(kind) {
+  const thread = getActiveThread();
+  if (!thread) return;
+  const input = document.getElementById(kind === 'blocked'
+    ? 'lore-memory-block-input' : 'lore-memory-pin-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  if (addMemoryFact(thread, kind, text)) {
+    input.value = '';
+    saveState();
+    openLoreInspector();
+  }
+}
+
+/** Brief button flash on the action row so a pin/block visibly landed.
+ *  Mirrors copyMessage's per-button flash — same dance, no dependency.
+ *  Indexes by the message row's data-index, NOT positionally: #messages
+ *  also holds system-inject banners (.message-system-inject), which would
+ *  shift a positional lookup onto the wrong row. */
+function _memoryFlashBtn(index, kind) {
+  const msgEl = document.querySelector(`#messages .message[data-index="${index}"]`);
+  if (!msgEl) return;
+  const btn = msgEl.querySelector('.msg-action-btn' + (kind === 'blocked' ? '.btn-block' : '.btn-pin'));
+  if (!btn) return;
+  const was = btn.textContent;
+  btn.textContent = kind === 'blocked' ? 'blocked' : 'pinned';
+  setTimeout(() => { btn.textContent = was; }, 1200);
 }
 
 /** Copy the current summary, for pasting into a bug report.
@@ -649,18 +781,27 @@ function copyLoreSummary(btn) {
   }
 }
 
-/** Header chip: always-available entry point, hidden when there is no lore. */
+/** Header chip: always-available entry point, hidden when there is
+ *  neither lore nor user memory. Memory counts show even before the
+ *  first compression, because a pin is injected from the first turn. */
 function updateLoreChip() {
   const chip = document.getElementById('lore-chip');
   if (!chip) return;
   const thread = getActiveThread();
   const lore = (thread && thread.lore) || '';
-  if (!lore.trim()) { chip.style.display = 'none'; return; }
+  const memory = getThreadMemory(thread);
+  const nPin = (memory.pinned && memory.pinned.length) || 0;
+  const nBlock = (memory.blocked && memory.blocked.length) || 0;
+  if (!lore.trim() && nPin === 0 && nBlock === 0) { chip.style.display = 'none'; return; }
   const passes = (thread && Array.isArray(thread.loreLog)) ? thread.loreLog.length : 0;
   chip.style.display = '';
-  chip.textContent = 'LORE ~' + _loreTokens(lore) + 't';
-  chip.title = 'Running summary: ' + lore.length + ' chars, '
-             + passes + ' compression' + (passes === 1 ? '' : 's')
+  chip.textContent = (nPin || nBlock)
+    ? 'MEM ' + nPin + (nBlock ? '/' + nBlock : '') + (lore.trim() ? ' · LORE ~' + _loreTokens(lore) + 't' : '')
+    : 'LORE ~' + _loreTokens(lore) + 't';
+  chip.title = (nPin ? nPin + ' pinned' + (nBlock ? ', ' : '') : '')
+             + (nBlock ? nBlock + ' blocked' : '')
+             + (lore.trim() ? ' · summary ' + lore.length + ' chars' : '')
+             + (passes ? ' · ' + passes + ' compression' + (passes === 1 ? '' : 's') : '')
              + '. Click to inspect.';
 }
 

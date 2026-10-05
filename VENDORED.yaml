@@ -8,17 +8,29 @@
 # "complete" were indistinguishable to every reader.
 repo: ElodineOfficial/GobboNet
 
-# The release this snapshot corresponds to. `unknown` is honest here: the tree carries no
-# version marker. What IS verifiable is the boundary -- it predates the Go launcher
-# (grep finds no `usr/lib/gobbonet`, `gobbonet-launch` or `go.mod`), which arrived in v1.6.
-vendored_release: unknown
-evidence: "pre-Go web-app tree: launch.bat + fileserver.ps1 + hardware-probe.ps1, no go.mod"
+# The release this snapshot corresponds to. IDENTIFIED 2026-10-04 by blob comparison
+# against every upstream commit from 07-20 to 08-24: 48 of 50 files equal upstream
+# 5524fd4 ("Update README.md for 1.5+ updates", 2026-08-13), which is tag v1.5.3
+# (14488a4) plus one README commit; launch.bat and setup-lan.bat differ only in CRLF.
+# It predates the Go launcher (no go.mod, no gobbonet-launch), which arrived in v1.6.
+vendored_release: v1.5.3
+vendored_commit: 5524fd4
+vendored_license: MIT
+evidence: "blob match 48/50 vs upstream 5524fd4 (v1.5.3 + README); remaining 2 differ only in line endings"
 
 # The newest upstream release we have LOOKED AT and decided not to re-vendor.
 # When upstream publishes something newer than this, the check goes red -- on purpose.
 # That is the whole mechanism: drift becomes a decision instead of a silence.
-acknowledged_behind: "v1.7.6"
+acknowledged_behind: "1.7.6-Hotfix"
 reason: >
+  Owner decided 2026-10-04: stay MIT, clean-room. Upstream relicensed MIT -> AGPL-3.0 in 5a2f4f1
+  ("Copyleft > MIT", 2026-08-30), which shipped in 1.7. Taking ANY 1.7.x code puts the
+  AGPL network source-offer duty on every surface that serves this tree and puts AGPL
+  code inside images labelled otherwise, so we stay on the MIT v1.5.3 base and
+  reimplement wanted features clean-room from release-note specs (never copy or read
+  1.7.x code while implementing). A licence-drift check records the upstream licence and goes red if it
+  changes again. Read 1.7.6-Hotfix (2026-09-26) release notes 2026-10-04.
+  Earlier context:
   Deliberate, re-decided 2026-09-25 after reading the release notes for 1.7, v1.7.2,
   v1.7.3 and v1.7.6. We vendor this tree to READ (the adapter, the mods and the consent
   work all cite js/ line numbers), not to run; re-vendoring churns those citations.

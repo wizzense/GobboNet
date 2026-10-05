@@ -16,7 +16,9 @@
 //   3. applyExtensions actually INJECTED the adapter (window.__aitherBonsaiAdapter
 //      is set, meaning the extension script ran — not just listed),
 //   4. the pre-mods save's extension ENABLE flag was honoured (turned on, since
-//      an empty pre-mods save is not a deliberate off).
+//      an empty pre-mods save is not a deliberate off),
+//   5. (scenario 2) a user whose save already HAS extensions of their own gets
+//      the adapter seeded and loaded, and keeps their own mod.
 //
 //   node mods-seed.smoke.mjs <url>
 //   exit 0 = seeded mods load for an existing user; exit 1 = something broke.
@@ -117,7 +119,8 @@ await send("Page.navigate", { url: bust(URL) });
 for (let i = 0; i < 60; i++) {
   await sleep(250);
   const ready = await evalJs(
-    "typeof createThread === 'function' && typeof state !== 'undefined' && state.threads !== undefined && document.readyState === 'complete'");
+    "typeof createThread === 'function' && typeof state !== 'undefined' && state.threads !== undefined && document.readyState === 'complete'"
+    + " && typeof _appBooted !== 'undefined' && _appBooted === true");
   if (ready) break;
 }
 await sleep(500); // let extensions apply
@@ -187,7 +190,68 @@ const banner = await evalJs(`
 if (banner) fail("false 'adapter failed' banner shown despite loaded adapter");
 ok("no false failure banner");
 
-console.log("\nMODS-SEED SMOKE PASS — shipped mods load for an existing pre-mods user");
+console.log("[6] an existing user WITH saved extensions (their own mod) still gets the adapter");
+// The returning-visitor case on our own origins (2026-10-04): a save that
+// already HAS extensions (the user added a mod of their own) but predates
+// seeding. Before the seeding loop reached the top-level tree that the Hub
+// build stages, loadState replaced state.extensions with this saved list
+// wholesale, so the adapter never loaded and the page showed
+// "ADAPTER FAILED TO LOAD". The user's own mod must survive the seeding.
+// Make the save the ONLY state the next boot can read. IndexedDB holds
+// scenario 1's migrated save, and the page flushes its in-memory state to
+// IndexedDB on pagehide, so a plain reload would boot from THAT and never
+// look at localStorage (timing-dependent; measured flaky 2026-10-04). So:
+// silence the page's own saves, close and delete its database, then write
+// the localStorage blob a returning pre-IndexedDB user has.
+const seed2 = await send("Runtime.evaluate", { awaitPromise: true, returnByValue: true, expression: `
+  (async () => {
+    window.saveState = function () {};
+    window.flushBeforeExit = function () {};
+    try { if (typeof _idb !== 'undefined' && _idb) _idb.close(); } catch (e) {}
+    await new Promise((res) => {
+      const r = indexedDB.deleteDatabase(IDB_DB);
+      r.onsuccess = r.onerror = r.onblocked = () => res();
+    });
+    localStorage.setItem('gobbonet_chat_state', JSON.stringify({
+      threads: [],
+      activeThreadId: null,
+      settings: { tokenLimit: 24576 },
+      characterCards: [],
+      personaCards: [],
+      extensions: { enabled: true, styles: [], scripts: [
+        { id: 'user_own_mod', name: 'My own mod', url: '', raw: 'window.__userOwnMod = true;' }
+      ] },
+      macros: [],
+      seededDefaultMacros: ['continue', 'fast_forward', 'auto_continue']
+    }));
+    return !!localStorage.getItem('gobbonet_chat_state');
+  })()
+` });
+const seeded2 = seed2.result?.result?.value;
+if (!seeded2) fail("could not seed the saved-extensions localStorage");
+await send("Page.navigate", { url: bust(URL) });
+for (let i = 0; i < 60; i++) {
+  await sleep(250);
+  const ready = await evalJs(
+    "typeof createThread === 'function' && typeof state !== 'undefined' && state.threads !== undefined && document.readyState === 'complete'"
+    + " && typeof _appBooted !== 'undefined' && _appBooted === true");
+  if (ready) break;
+}
+// The adapter installs after applyExtensions; give it the same window the
+// page's own watchdog gives it before deciding.
+let adapter2 = false;
+for (let i = 0; i < 20 && !adapter2; i++) {
+  await sleep(250);
+  adapter2 = await evalJs("!!window.__aitherBonsaiAdapter");
+}
+const ext2 = JSON.parse(await evalJs(`JSON.stringify((state.extensions.scripts || []).map(s => s.id))`));
+if (!ext2.includes('mod_js_bonsai_adapter')) fail("saved-extensions user did not get the adapter seeded; got " + JSON.stringify(ext2));
+if (!ext2.includes('user_own_mod')) fail("seeding clobbered the user's own mod; got " + JSON.stringify(ext2));
+if (!adapter2) fail("saved-extensions user: adapter listed but window.__aitherBonsaiAdapter never set");
+if (!(await evalJs("!!window.__userOwnMod"))) fail("the user's own mod did not run after seeding");
+ok("adapter seeded AND loaded; the user's own mod kept and ran: " + JSON.stringify(ext2));
+
+console.log("\nMODS-SEED SMOKE PASS: shipped mods load for existing users (empty and saved extensions)");
 ws.close();
 chrome.kill();
 process.exit(0);
